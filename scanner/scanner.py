@@ -32,9 +32,9 @@ POLYGON_API_KEY    = os.environ.get("MASSIVE_API_KEY", "")
 PUSHOVER_USER_KEY  = os.environ.get("PUSHOVER_USER_KEY", "utvy26j5q66kae27ncwxsftfcuhi92")
 PUSHOVER_APP_TOKEN = os.environ.get("PUSHOVER_APP_TOKEN", "a3szzncpvgyevbck6z5z5yszm7nzg3")
 
-MODEL_DIR  = Path(os.environ.get("MODEL_DIR", "/app/models"))
-LOG_DIR    = Path(os.environ.get("LOG_DIR", "/app/logs"))
-ALERT_DIR  = Path(os.environ.get("ALERT_DIR", "/app/alerts"))
+MODEL_DIR  = Path(os.environ.get("MODEL_DIR", "/opt/render/project/src/models"))
+LOG_DIR    = Path(os.environ.get("LOG_DIR", "/tmp/logs"))
+ALERT_DIR  = Path(os.environ.get("ALERT_DIR", "/tmp/alerts"))
 
 for d in [LOG_DIR, ALERT_DIR]:
     d.mkdir(parents=True, exist_ok=True)

@@ -1,17 +1,24 @@
 """
-THE DELTA v2 — main.py (v2)
+THE DELTA v2 — main.py (v3)
 ============================
-Single entry point. Runs 24/7 on Render.
+Two-phase premarket scanner:
 
-Uses BULK snapshot — one API call gets ALL 8,000 stocks.
-Catches stocks at +5-8% not +35% like gainers endpoint.
+Phase 1 — Universe builder (runs at midnight + startup):
+  Loads ALL tickers from grouped daily bars
+  Filters by price > $0.10, prev vol > $10k
+  Saves watchlist of ~5,000 candidates
+
+Phase 2 — Scanner (every 60s):
+  Pulls specific ticker snapshots in batches of 100
+  This endpoint populates premarket price AND volume
+  Scores through models, fires alerts
 
 Schedule (ET):
-  4AM  - 9:30AM:  Premarket scanner (bulk snapshot every 60s)
-  9:30AM - 11AM:  Early market scanner (bulk snapshot every 60s)
+  4AM  - 9:30AM:  Premarket scanner
+  9:30AM - 11AM:  Early market scanner
   11AM - 4PM:     Sleep
-  4PM  - 8PM:     AH scanner (bulk snapshot every 60s)
-  8PM  - 4AM:     Basecamp (EDGAR watch every 10min)
+  4PM  - 8PM:     AH scanner
+  8PM  - 4AM:     Basecamp EDGAR watch
   5AM:            Morning summary
   10PM:           Nightly summary
 """
@@ -45,14 +52,12 @@ ALERT_DIR  = Path(os.environ.get("ALERT_DIR",  "/tmp/alerts"))
 for d in [LOG_DIR, ALERT_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
-# Filters
-MIN_PRICE     = 0.10
-MIN_VOLUME    = 10_000
-MIN_GAP       = 0.05   # 5% minimum move from prev_close
-SCAN_INTERVAL = 60     # seconds between scans
-
-# Thresholds
-THRESHOLDS = {"seed": 0.70, "super": 0.60, "mega": 0.50}
+MIN_PRICE      = 0.10
+MIN_PREV_VOL   = 10_000
+MIN_GAP        = 0.05
+BATCH_SIZE     = 100
+SCAN_INTERVAL  = 60
+THRESHOLDS     = {"seed": 0.70, "super": 0.60, "mega": 0.50}
 
 # ── Logging ───────────────────────────────────────────────────
 logging.basicConfig(
@@ -99,7 +104,7 @@ def send_pushover(title, message, alert_type="seed", priority=0):
         if r.status_code == 200:
             log.info(f"Pushover sent: {title}")
         else:
-            log.warning(f"Pushover failed: {r.status_code}")
+            log.warning(f"Pushover failed: {r.status_code} {r.text}")
     except Exception as e:
         log.warning(f"Pushover error: {e}")
 
@@ -133,8 +138,8 @@ _last_call = 0.0
 def poly_get(path, params=None):
     global _last_call
     elapsed = time.time() - _last_call
-    if elapsed < 0.2:
-        time.sleep(0.2 - elapsed)
+    if elapsed < 0.21:
+        time.sleep(0.21 - elapsed)
     _last_call = time.time()
     try:
         r = poly_session.get(
@@ -144,48 +149,53 @@ def poly_get(path, params=None):
         )
         if r.status_code == 200:
             return r.json()
+        else:
+            log.debug(f"Polygon {r.status_code}: {path}")
     except Exception as e:
         log.debug(f"Polygon error: {e}")
     return None
 
-# ── Prev close map — loaded once at 4AM ──────────────────────
-_prev_close_map  = {}   # ticker → prev_close
-_prev_close_date = None # date the map was built for
+# ── Holiday list ──────────────────────────────────────────────
+HOLIDAYS = {
+    date(2024,1,1),date(2024,1,15),date(2024,2,19),date(2024,3,29),
+    date(2024,5,27),date(2024,6,19),date(2024,7,4),date(2024,9,2),
+    date(2024,11,28),date(2024,12,25),
+    date(2025,1,1),date(2025,1,9),date(2025,1,20),date(2025,2,17),
+    date(2025,4,18),date(2025,5,26),date(2025,6,19),date(2025,7,4),
+    date(2025,9,1),date(2025,11,27),date(2025,12,25),
+    date(2026,1,1),date(2026,1,19),date(2026,2,16),date(2026,4,3),
+    date(2026,5,25),date(2026,6,19),date(2026,7,3),date(2026,9,7),
+    date(2026,11,26),date(2026,12,25),
+}
 
 def get_last_trading_day():
-    """Get the most recent trading day before today."""
     check = date.today() - timedelta(days=1)
-    holidays = {
-        date(2024,1,1),date(2024,1,15),date(2024,2,19),date(2024,3,29),
-        date(2024,5,27),date(2024,6,19),date(2024,7,4),date(2024,9,2),
-        date(2024,11,28),date(2024,12,25),
-        date(2025,1,1),date(2025,1,9),date(2025,1,20),date(2025,2,17),
-        date(2025,4,18),date(2025,5,26),date(2025,6,19),date(2025,7,4),
-        date(2025,9,1),date(2025,11,27),date(2025,12,25),
-        date(2026,1,1),date(2026,1,19),date(2026,2,16),date(2026,4,3),
-        date(2026,5,25),date(2026,6,19),date(2026,7,3),date(2026,9,7),
-        date(2026,11,26),date(2026,12,25),
-    }
     for _ in range(7):
-        if check.weekday() < 5 and check not in holidays:
+        if check.weekday() < 5 and check not in HOLIDAYS:
             return check
         check -= timedelta(days=1)
     return check
 
-def load_prev_closes():
+# ══════════════════════════════════════════════════════════════
+# PHASE 1 — UNIVERSE BUILDER
+# ══════════════════════════════════════════════════════════════
+_watchlist      = []   # list of {ticker, prev_close, prev_vol}
+_watchlist_date = None
+
+def build_watchlist():
     """
-    ONE API call loads ALL tickers' previous closes.
-    Uses Polygon grouped daily bars for last trading day.
-    Called once at startup and refreshed each new day.
+    Load ALL tickers from grouped daily bars.
+    Filter by price and volume.
+    Runs once per day at startup.
     """
-    global _prev_close_map, _prev_close_date
+    global _watchlist, _watchlist_date
 
     today = date.today()
-    if _prev_close_date == today and _prev_close_map:
-        return  # already loaded for today
+    if _watchlist_date == today and _watchlist:
+        return
 
     last_day = get_last_trading_day()
-    log.info(f"Loading prev closes from {last_day}...")
+    log.info(f"Building watchlist from {last_day}...")
 
     data = poly_get(
         f"/v2/aggs/grouped/locale/us/market/stocks/{last_day.isoformat()}",
@@ -193,148 +203,152 @@ def load_prev_closes():
     )
 
     if not data or "results" not in data:
-        log.warning(f"Could not load grouped daily bars for {last_day}")
+        log.warning(f"Could not load grouped bars for {last_day}")
         return
 
-    new_map = {}
+    watchlist = []
     for bar in data["results"]:
-        ticker = bar.get("T", "")
-        close  = bar.get("c", 0) or 0
-        if ticker and close > 0:
-            new_map[ticker] = close
+        ticker  = bar.get("T", "")
+        close   = bar.get("c", 0) or 0
+        volume  = bar.get("v", 0) or 0
+        dollar_vol = close * volume
 
-    _prev_close_map  = new_map
-    _prev_close_date = today
-    log.info(f"Loaded {len(_prev_close_map)} prev closes from {last_day}")
+        if not ticker:
+            continue
+        if close < MIN_PRICE:
+            continue
+        if dollar_vol < MIN_PREV_VOL * close:
+            continue
+        # Skip obvious ETFs and funds (usually 4+ chars with patterns)
+        if len(ticker) > 5:
+            continue
 
-def get_prev_close(ticker):
-    """Get prev close from map. Falls back to individual call if missing."""
-    if not _prev_close_map:
-        load_prev_closes()
+        watchlist.append({
+            "ticker":     ticker,
+            "prev_close": close,
+            "prev_vol":   volume,
+        })
 
-    close = _prev_close_map.get(ticker, 0)
-    if close > 0:
-        return close
+    _watchlist      = watchlist
+    _watchlist_date = today
+    log.info(f"Watchlist built: {len(_watchlist)} tickers from {last_day}")
 
-    # Individual fallback for tickers not in grouped bars
-    check_date = date.today() - timedelta(days=1)
-    for _ in range(5):
-        if check_date.weekday() < 5:
-            data = poly_get(
-                f"/v1/open-close/{ticker}/{check_date.isoformat()}"
-            )
-            if data and data.get("status") == "OK":
-                c = data.get("close", 0) or 0
-                if c > 0:
-                    return c
-        check_date -= timedelta(days=1)
-    return 0
-
-# ── BULK SNAPSHOT — the key function ─────────────────────────
-def get_bulk_candidates(use_today_close=False):
+# ══════════════════════════════════════════════════════════════
+# PHASE 2 — SPECIFIC TICKER SNAPSHOT (populates premarket data)
+# ══════════════════════════════════════════════════════════════
+def get_batch_snapshots(tickers):
     """
-    ONE API call → ALL ~8,000 stocks snapshot.
-    Filter locally for gap + volume.
-    Returns candidates at +5% not +35%.
-    use_today_close=True for AH mode (compare to today close, not yesterday)
+    Pull snapshots for specific tickers.
+    This endpoint populates premarket price AND volume.
+    Returns list of snapshot dicts.
     """
+    if not tickers:
+        return []
+
+    ticker_str = ",".join(tickers)
     data = poly_get(
         "/v2/snapshot/locale/us/markets/stocks/tickers",
-        {"include_otc": "false"}
+        {"tickers": ticker_str, "include_otc": "false"}
     )
 
     if not data or "tickers" not in data:
-        log.warning("Bulk snapshot returned no data")
         return []
 
-    # Debug — log what we're seeing
-    total = len(data["tickers"])
-    sample = data["tickers"][:3] if data["tickers"] else []
-    for s in sample:
-        day  = s.get("day", {})
-        prev = s.get("prevDay", {})
-        log.info(f"SAMPLE: {s.get('ticker')} prevClose={prev.get('c')} "
-                 f"todayClose={day.get('c')} vol={day.get('v')} "
-                 f"changePerc={s.get('todaysChangePerc')}")
-    log.info(f"Bulk snapshot: {total} total tickers")
+    return data["tickers"]
+
+def get_candidates(use_today_close=False):
+    """
+    Scan watchlist in batches.
+    Returns candidates that pass gap + volume filters.
+    """
+    if not _watchlist:
+        build_watchlist()
+        if not _watchlist:
+            return []
 
     candidates = []
-    for t in data["tickers"]:
-        ticker = t.get("ticker", "")
-        day    = t.get("day", {})
-        prev   = t.get("prevDay", {})
+    tickers = [w["ticker"] for w in _watchlist]
+    prev_map = {w["ticker"]: w for w in _watchlist}
 
-        prev_close     = prev.get("c", 0) or 0
-        pm_close       = day.get("c", 0) or 0
-        pm_open        = day.get("o", 0) or 0
-        pm_high        = day.get("h", 0) or 0
-        pm_low         = day.get("l", 0) or 0
-        volume         = day.get("v", 0) or 0
-        vwap           = day.get("vw", 0) or 0
-        change_perc    = t.get("todaysChangePerc", 0) or 0
-        last_min_vol   = t.get("min", {}).get("v", 0) or 0
-        prev_vol       = prev.get("v", 0) or 0
+    # Process in batches of BATCH_SIZE
+    for i in range(0, len(tickers), BATCH_SIZE):
+        batch = tickers[i:i + BATCH_SIZE]
+        snaps = get_batch_snapshots(batch)
 
-        # Get prev close — use our map first, fall back to prevDay.c
-        if prev_close <= 0:
-            prev_close = get_prev_close(ticker)
-        if prev_close <= 0 or prev_close < MIN_PRICE:
-            continue
+        for t in snaps:
+            ticker = t.get("ticker", "")
+            day    = t.get("day", {})
+            prev   = t.get("prevDay", {})
+            min_bar = t.get("min", {})
 
-        # If day.c = 0 (premarket — Polygon hasn't populated day yet)
-        # back-calculate from changePerc which Polygon always provides
-        if pm_close <= 0 and change_perc != 0:
-            pm_close = prev_close * (1 + change_perc / 100)
-            pm_open  = pm_close
-            pm_high  = pm_close
-            pm_low   = pm_close
+            # Price — use day.c first, fall back to last minute bar
+            pm_close = day.get("c", 0) or 0
+            if pm_close <= 0:
+                pm_close = min_bar.get("c", 0) or 0
 
-        if pm_close <= 0:
-            continue
+            pm_open   = day.get("o", 0) or pm_close
+            pm_high   = day.get("h", 0) or pm_close
+            pm_low    = day.get("l", 0) or pm_close
 
-        # Volume filter — smart premarket handling
-        # Polygon day.v = 0 during premarket, use last minute + prev day instead
-        if volume > 0:
-            # Market hours — use actual today volume
-            if volume < MIN_VOLUME:
+            # Volume — use day.v first, fall back to last minute bar
+            volume = day.get("v", 0) or 0
+            if volume <= 0:
+                volume = min_bar.get("v", 0) or 0
+
+            # Prev close — use our watchlist map (from grouped bars)
+            prev_data  = prev_map.get(ticker, {})
+            prev_close = prev_data.get("prev_close", 0)
+            prev_vol   = prev_data.get("prev_vol", 0)
+
+            # Fallback to snapshot prevDay if needed
+            if prev_close <= 0:
+                prev_close = prev.get("c", 0) or 0
+            if prev_close <= 0 or prev_close < MIN_PRICE:
                 continue
-        else:
-            # Premarket — Polygon hasn't populated day.v yet
-            # Require EITHER last minute had activity OR prev day was liquid
-            if last_min_vol < 5_000 and prev_vol < MIN_VOLUME:
+
+            # If still no current price, use changePerc to back-calculate
+            change_perc = t.get("todaysChangePerc", 0) or 0
+            if pm_close <= 0 and change_perc != 0:
+                pm_close = prev_close * (1 + change_perc / 100)
+                pm_open = pm_high = pm_low = pm_close
+
+            if pm_close <= 0:
                 continue
-        
-        # Use best available volume for features
-        effective_volume = volume if volume > 0 else max(last_min_vol, prev_vol)
 
-        # AH mode — compare to today's close not yesterday's
-        if use_today_close:
-            today_close = day.get("c", 0) or 0
-            ref_price = today_close if today_close > 0 else prev_close
-        else:
-            ref_price = prev_close
+            # Reference price for gap calculation
+            if use_today_close:
+                ref_price = day.get("c", 0) or prev_close
+            else:
+                ref_price = prev_close
 
-        # Calculate gap from reference price
-        gap = (pm_close - ref_price) / ref_price
-        if gap < MIN_GAP:
-            continue
+            if ref_price <= 0:
+                continue
 
-        prev_close = ref_price  # use as prev_close for feature building
+            gap = (pm_close - ref_price) / ref_price
+            if gap < MIN_GAP:
+                continue
 
-        candidates.append({
-            "ticker":     ticker,
-            "prev_close": prev_close,
-            "pm_open":    pm_open,
-            "pm_high":    pm_high,
-            "pm_low":     pm_low,
-            "pm_close":   pm_close,
-            "volume":     effective_volume,
-            "vwap":       vwap,
-            "gap_pct":    gap,
-            "change_pct": t.get("todaysChangePerc", 0),
-        })
+            # Volume filter
+            if volume > 0:
+                if volume < MIN_PREV_VOL:
+                    continue
+            else:
+                # No current volume yet — require prev day was liquid
+                if prev_vol < MIN_PREV_VOL:
+                    continue
 
-    # Sort by gap descending
+            candidates.append({
+                "ticker":     ticker,
+                "prev_close": prev_close,
+                "pm_open":    pm_open,
+                "pm_high":    pm_high,
+                "pm_low":     pm_low,
+                "pm_close":   pm_close,
+                "volume":     volume if volume > 0 else prev_vol,
+                "gap_pct":    gap,
+                "change_pct": change_perc,
+            })
+
     candidates.sort(key=lambda x: x["gap_pct"], reverse=True)
     return candidates
 
@@ -388,7 +402,6 @@ def build_features(snap, details, feature_cols, has_8k=0):
     rem_mega  = (mega_tgt  - pm_close) / pm_close if pm_close > 0 else 0
 
     features = {col: 0 for col in feature_cols}
-
     overrides = {
         "prev_close":             prev_close,
         "pm_open":                pm_open,
@@ -417,7 +430,6 @@ def build_features(snap, details, feature_cols, has_8k=0):
         "days_since_last_seed":   999,
         "days_since_dilution":    999,
     }
-
     for k, v in overrides.items():
         if k in features:
             features[k] = v
@@ -444,27 +456,17 @@ def score(fvec, models, thresholds):
     return scores, alerts
 
 # ── Alert tracking ────────────────────────────────────────────
-def already_alerted(ticker, mode="scanner"):
-    """Check if ticker already alerted in ANY window today."""
-    # Check current mode
-    f = ALERT_DIR / f"{date.today().isoformat()}_{mode}.json"
-    if f.exists():
-        with open(f) as fp:
-            if ticker in json.load(fp):
-                return True
-
-    # Also check all other windows — don't double alert
-    for m in ["premarket", "early_market", "ah", "basecamp"]:
-        if m == mode:
-            continue
-        f2 = ALERT_DIR / f"{date.today().isoformat()}_{m}.json"
-        if f2.exists():
-            with open(f2) as fp:
+def already_alerted(ticker):
+    today = date.today().isoformat()
+    for mode in ["premarket", "early_market", "ah", "basecamp"]:
+        f = ALERT_DIR / f"{today}_{mode}.json"
+        if f.exists():
+            with open(f) as fp:
                 if ticker in json.load(fp):
                     return True
     return False
 
-def log_alert(ticker, alert_type, score_val, scores, snap, mode="scanner"):
+def log_alert(ticker, alert_type, score_val, scores, snap, mode):
     f = ALERT_DIR / f"{date.today().isoformat()}_{mode}.json"
     alerts = {}
     if f.exists():
@@ -508,17 +510,16 @@ def format_alert(ticker, alert_type, score_val, scores, snap, details, mode=""):
     return title, msg
 
 # ══════════════════════════════════════════════════════════════
-# MAIN SCAN — used for premarket, early market, and AH
+# MAIN SCAN
 # ══════════════════════════════════════════════════════════════
 def run_scan(models, feature_cols, thresholds, mode="premarket", use_today_close=False):
-    candidates = get_bulk_candidates(use_today_close=use_today_close)
+    candidates = get_candidates(use_today_close=use_today_close)
     log.info(f"{mode}: {len(candidates)} candidates (gap >= {MIN_GAP*100:.0f}%)")
 
     fired = 0
     for snap in candidates:
         ticker = snap["ticker"]
-
-        if already_alerted(ticker, mode):
+        if already_alerted(ticker):
             continue
 
         details = get_details(ticker)
@@ -539,14 +540,15 @@ def run_scan(models, feature_cols, thresholds, mode="premarket", use_today_close
 
         log.info(
             f"ALERT [{mode}]: {ticker} {alert_type.upper()} "
-            f"score={score_val:.3f} gap={snap['gap_pct']*100:+.1f}%"
+            f"score={score_val:.3f} gap={snap['gap_pct']*100:+.1f}% "
+            f"vol={snap['volume']:,.0f}"
         )
         fired += 1
 
     return fired
 
 # ══════════════════════════════════════════════════════════════
-# BASECAMP — EDGAR overnight watch
+# BASECAMP
 # ══════════════════════════════════════════════════════════════
 edgar_session = requests.Session()
 edgar_session.headers.update({"User-Agent": EDGAR_USER_AGENT})
@@ -581,31 +583,38 @@ def run_basecamp(models, feature_cols, thresholds):
     fired = 0
     for filing in filings:
         ticker = filing["ticker"]
-        if already_alerted(ticker, "basecamp"):
+        if already_alerted(ticker):
             continue
 
-        # Get snapshot
-        data = poly_get(f"/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}")
-        if not data or "ticker" not in data:
+        snaps = get_batch_snapshots([ticker])
+        if not snaps:
             continue
 
-        t    = data["ticker"]
+        t    = snaps[0]
         day  = t.get("day", {})
         prev = t.get("prevDay", {})
 
         prev_close = prev.get("c", 0) or 0
         if prev_close < MIN_PRICE:
+            # Try watchlist
+            wl = next((w for w in _watchlist if w["ticker"] == ticker), None)
+            if wl:
+                prev_close = wl["prev_close"]
+        if prev_close < MIN_PRICE:
             continue
+
+        pm_close = day.get("c", 0) or prev_close
+        volume   = day.get("v", 0) or 0
 
         snap = {
             "ticker":     ticker,
             "prev_close": prev_close,
-            "pm_open":    day.get("o", 0),
-            "pm_high":    day.get("h", 0),
-            "pm_low":     day.get("l", 0),
-            "pm_close":   day.get("c", 0) or prev_close,
-            "volume":     day.get("v", 0),
-            "gap_pct":    t.get("todaysChangePerc", 0) / 100,
+            "pm_open":    day.get("o", 0) or pm_close,
+            "pm_high":    day.get("h", 0) or pm_close,
+            "pm_low":     day.get("l", 0) or pm_close,
+            "pm_close":   pm_close,
+            "volume":     volume,
+            "gap_pct":    (pm_close - prev_close) / prev_close if prev_close > 0 else 0,
         }
 
         details = get_details(ticker)
@@ -623,10 +632,7 @@ def run_basecamp(models, feature_cols, thresholds):
         )
         priority = 1 if alert_type in ("super", "mega") else 0
         send_pushover(title, msg, alert_type, priority)
-
-        log.info(
-            f"BASECAMP ALERT: {ticker} {alert_type.upper()} score={score_val:.3f}"
-        )
+        log.info(f"BASECAMP ALERT: {ticker} {alert_type.upper()} score={score_val:.3f}")
         fired += 1
 
     return fired
@@ -635,9 +641,9 @@ def run_basecamp(models, feature_cols, thresholds):
 # SUMMARIES
 # ══════════════════════════════════════════════════════════════
 def send_morning_summary(models, feature_cols, thresholds):
-    candidates = get_bulk_candidates()
+    candidates = get_candidates()[:50]
     hot = []
-    for snap in candidates[:50]:
+    for snap in candidates:
         details = get_details(snap["ticker"])
         fvec    = build_features(snap, details, feature_cols)
         scores, _ = score(fvec, models, thresholds)
@@ -645,16 +651,14 @@ def send_morning_summary(models, feature_cols, thresholds):
             hot.append((snap["ticker"], scores, snap))
 
     if not hot:
-        msg = (f"Quiet morning. {len(candidates)} stocks "
-               f"gapping 5%+, none scoring high yet.")
+        msg = f"Quiet morning. {len(candidates)} gapping 5%+, none scoring high."
     else:
         lines = [f"☀️ {len(hot)} setup(s) scoring above 0.40:\n"]
-        for ticker, sc, snap in sorted(
-            hot, key=lambda x: x[1].get("seed", 0), reverse=True
-        )[:5]:
+        for ticker, sc, snap in sorted(hot, key=lambda x: x[1].get("seed",0), reverse=True)[:5]:
             gap = snap.get("gap_pct", 0) * 100
+            vol = snap.get("volume", 0)
             lines.append(
-                f"{ticker}: {gap:+.1f}% | "
+                f"{ticker}: {gap:+.1f}% vol={vol:,.0f} | "
                 f"S:{sc.get('seed',0):.2f} Su:{sc.get('super',0):.2f}"
             )
         msg = "\n".join(lines)
@@ -662,9 +666,8 @@ def send_morning_summary(models, feature_cols, thresholds):
     send_pushover("☀️ Delta v2 Morning Report", msg, "seed", priority=0)
 
 def send_nightly_summary():
-    today   = date.today().isoformat()
+    today = date.today().isoformat()
     all_alerts = {}
-
     for mode in ["premarket", "early_market", "ah", "basecamp"]:
         f = ALERT_DIR / f"{today}_{mode}.json"
         if f.exists():
@@ -675,15 +678,12 @@ def send_nightly_summary():
         msg = "No alerts today."
     else:
         lines = [f"📊 {len(all_alerts)} alert(s) today:\n"]
-        for ticker, info in sorted(
-            all_alerts.items(),
-            key=lambda x: x[1].get("score", 0),
-            reverse=True
-        ):
+        for ticker, info in sorted(all_alerts.items(),
+                                   key=lambda x: x[1].get("score",0), reverse=True):
             lines.append(
                 f"  {ticker}: {info['type'].upper()} "
                 f"score={info['score']:.3f} "
-                f"gap={info.get('gap_pct', 0)*100:+.1f}%"
+                f"gap={info.get('gap_pct',0)*100:+.1f}%"
             )
         msg = "\n".join(lines)
 
@@ -697,7 +697,7 @@ def main():
     time.sleep(2)
 
     log.info("=" * 50)
-    log.info("THE DELTA v2 — Starting (bulk snapshot mode)")
+    log.info("THE DELTA v2 — Starting (two-phase scanner)")
     log.info("=" * 50)
 
     models, feature_cols, thresholds = load_models()
@@ -705,8 +705,8 @@ def main():
         log.error("No models found")
         return
 
-    # Load prev closes immediately at startup
-    load_prev_closes()
+    # Build watchlist at startup
+    build_watchlist()
 
     morning_summary_sent = False
     nightly_summary_sent = False
@@ -718,7 +718,7 @@ def main():
         hour   = now.hour
         minute = now.minute
 
-        # Reset daily flags at midnight
+        # Reset daily state
         if last_date != now.date():
             morning_summary_sent = False
             nightly_summary_sent = False
@@ -726,45 +726,44 @@ def main():
             ticker_cache.clear()
             last_date = now.date()
             log.info(f"New day: {now.date()}")
-            # Load prev closes for the new day — ONE API call
-            load_prev_closes()
+            build_watchlist()
 
-        # ── 10 PM nightly summary ──────────────────────────
+        # 10 PM nightly summary
         if hour == 22 and minute < 5 and not nightly_summary_sent:
             send_nightly_summary()
             nightly_summary_sent = True
 
-        # ── 5 AM morning summary ───────────────────────────
+        # 5 AM morning summary
         if hour == 5 and minute < 5 and not morning_summary_sent:
             send_morning_summary(models, feature_cols, thresholds)
             morning_summary_sent = True
 
-        # ── PREMARKET: 4AM - 9:30AM ────────────────────────
+        # PREMARKET: 4AM - 9:30AM
         in_premarket = hour >= 4 and (hour < 9 or (hour == 9 and minute < 30))
         if in_premarket:
             fired = run_scan(models, feature_cols, thresholds, "premarket")
-            log.info(f"Premarket scan: {fired} alerts")
+            log.info(f"Premarket scan done: {fired} alerts")
             time.sleep(SCAN_INTERVAL)
             continue
 
-        # ── EARLY MARKET: 9:30AM - 11AM ───────────────────
+        # EARLY MARKET: 9:30AM - 11AM
         in_early = (hour == 9 and minute >= 30) or hour == 10 or (hour == 11 and minute == 0)
         if in_early:
             fired = run_scan(models, feature_cols, thresholds, "early_market")
-            log.info(f"Early market scan: {fired} alerts")
+            log.info(f"Early market scan done: {fired} alerts")
             time.sleep(SCAN_INTERVAL)
             continue
 
-        # ── AH: 4PM - 8PM ─────────────────────────────────
+        # AH: 4PM - 8PM
         in_ah = hour >= 16 and hour < 20
         if in_ah:
             fired = run_scan(models, feature_cols, thresholds, "ah",
                            use_today_close=True)
-            log.info(f"AH scan: {fired} alerts")
+            log.info(f"AH scan done: {fired} alerts")
             time.sleep(SCAN_INTERVAL)
             continue
 
-        # ── BASECAMP: 8PM - 4AM ────────────────────────────
+        # BASECAMP: 8PM - 4AM
         in_basecamp = hour >= 20 or hour < 4
         if in_basecamp:
             if (last_basecamp_scan is None or
@@ -774,7 +773,7 @@ def main():
             time.sleep(60)
             continue
 
-        # ── REST: 11AM - 4PM ──────────────────────────────
+        # REST: 11AM - 4PM
         log.debug(f"Resting ({hour}:{minute:02d} ET)")
         time.sleep(300)
 

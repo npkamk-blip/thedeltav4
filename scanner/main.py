@@ -57,7 +57,7 @@ MIN_PREV_VOL   = 10_000
 MIN_GAP        = 0.05
 BATCH_SIZE     = 100
 SCAN_INTERVAL  = 60
-THRESHOLDS     = {"seed": 0.70, "super": 0.60, "mega": 0.50}
+THRESHOLDS     = {"seed": 0.85, "super": 0.70, "mega": 0.60}
 
 # ── Logging ───────────────────────────────────────────────────
 logging.basicConfig(
@@ -458,15 +458,13 @@ def score(fvec, models, thresholds):
     return scores, alerts
 
 # ── Alert tracking ────────────────────────────────────────────
+_alerted_today = set()
+
 def already_alerted(ticker):
-    today = date.today().isoformat()
-    for mode in ["premarket", "early_market", "ah", "basecamp"]:
-        f = ALERT_DIR / f"{today}_{mode}.json"
-        if f.exists():
-            with open(f) as fp:
-                if ticker in json.load(fp):
-                    return True
-    return False
+    return ticker in _alerted_today
+
+def mark_alerted(ticker):
+    _alerted_today.add(ticker)
 
 def log_alert(ticker, alert_type, score_val, scores, snap, mode):
     f = ALERT_DIR / f"{date.today().isoformat()}_{mode}.json"
@@ -520,6 +518,8 @@ def run_scan(models, feature_cols, thresholds, mode="premarket", use_today_close
 
     fired = 0
     for snap in candidates:
+        if fired >= 5:  # max 5 alerts per scan
+            break
         ticker = snap["ticker"]
         if already_alerted(ticker):
             continue
@@ -533,6 +533,7 @@ def run_scan(models, feature_cols, thresholds, mode="premarket", use_today_close
 
         alert_type, score_val = alerts[0]
         log_alert(ticker, alert_type, score_val, scores, snap, mode)
+        mark_alerted(ticker)
 
         title, msg = format_alert(
             ticker, alert_type, score_val, scores, snap, details, mode
@@ -726,6 +727,7 @@ def main():
             nightly_summary_sent = False
             last_basecamp_scan   = None
             ticker_cache.clear()
+            _alerted_today.clear()
             last_date = now.date()
             log.info(f"New day: {now.date()}")
             build_watchlist()

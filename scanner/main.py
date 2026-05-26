@@ -272,10 +272,8 @@ def get_bulk_candidates(use_today_close=False):
         volume         = day.get("v", 0) or 0
         vwap           = day.get("vw", 0) or 0
         change_perc    = t.get("todaysChangePerc", 0) or 0
-
-        # Apply filters
-        if volume < MIN_VOLUME:
-            continue
+        last_min_vol   = t.get("min", {}).get("v", 0) or 0
+        prev_vol       = prev.get("v", 0) or 0
 
         # Get prev close — use our map first, fall back to prevDay.c
         if prev_close <= 0:
@@ -293,6 +291,21 @@ def get_bulk_candidates(use_today_close=False):
 
         if pm_close <= 0:
             continue
+
+        # Volume filter — smart premarket handling
+        # Polygon day.v = 0 during premarket, use last minute + prev day instead
+        if volume > 0:
+            # Market hours — use actual today volume
+            if volume < MIN_VOLUME:
+                continue
+        else:
+            # Premarket — Polygon hasn't populated day.v yet
+            # Require EITHER last minute had activity OR prev day was liquid
+            if last_min_vol < 5_000 and prev_vol < MIN_VOLUME:
+                continue
+        
+        # Use best available volume for features
+        effective_volume = volume if volume > 0 else max(last_min_vol, prev_vol)
 
         # AH mode — compare to today's close not yesterday's
         if use_today_close:
@@ -315,7 +328,7 @@ def get_bulk_candidates(use_today_close=False):
             "pm_high":    pm_high,
             "pm_low":     pm_low,
             "pm_close":   pm_close,
-            "volume":     volume,
+            "volume":     effective_volume,
             "vwap":       vwap,
             "gap_pct":    gap,
             "change_pct": t.get("todaysChangePerc", 0),

@@ -247,6 +247,17 @@ def get_bulk_candidates(use_today_close=False):
         log.warning("Bulk snapshot returned no data")
         return []
 
+    # Debug — log what we're seeing
+    total = len(data["tickers"])
+    sample = data["tickers"][:3] if data["tickers"] else []
+    for s in sample:
+        day  = s.get("day", {})
+        prev = s.get("prevDay", {})
+        log.info(f"SAMPLE: {s.get('ticker')} prevClose={prev.get('c')} "
+                 f"todayClose={day.get('c')} vol={day.get('v')} "
+                 f"changePerc={s.get('todaysChangePerc')}")
+    log.info(f"Bulk snapshot: {total} total tickers")
+
     candidates = []
     for t in data["tickers"]:
         ticker = t.get("ticker", "")

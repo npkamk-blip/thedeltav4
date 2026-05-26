@@ -57,7 +57,7 @@ MIN_PREV_VOL   = 10_000
 MIN_GAP        = 0.05
 BATCH_SIZE     = 100
 SCAN_INTERVAL  = 60
-THRESHOLDS     = {"seed": 0.85, "super": 0.70, "mega": 0.60}
+THRESHOLDS     = {"seed": 0.90, "super": 0.80, "mega": 0.70}
 
 # ── Logging ───────────────────────────────────────────────────
 logging.basicConfig(
@@ -217,12 +217,16 @@ def build_watchlist():
             continue
         if close < MIN_PRICE:
             continue
-        if close > 5.00:          # seeds are almost never above $5 prev close
+        if close > 2.00:          # seeds almost always under $2
             continue
-        if dollar_vol < MIN_PREV_VOL * close:
+        if dollar_vol < 25_000:   # need real liquidity
             continue
-        # Skip obvious ETFs and funds
+        # Skip warrants, units, rights, ETFs
         if len(ticker) > 5:
+            continue
+        if ticker.endswith("W") or ticker.endswith("R") or ticker.endswith("U"):
+            continue
+        if "." in ticker:         # skip preferred shares etc
             continue
 
         watchlist.append({
@@ -327,16 +331,20 @@ def get_candidates(use_today_close=False):
                 continue
 
             gap = (pm_close - ref_price) / ref_price
-            if gap < MIN_GAP:
+            if gap < 0.05:        # minimum 5% gap
+                continue
+
+            # Must have room to reach 100% — this is the real filter
+            remaining = (ref_price * 2.0 - pm_close) / pm_close
+            if remaining < 0.40:  # less than 40% room = too late
                 continue
 
             # Volume filter
             if volume > 0:
-                if volume < MIN_PREV_VOL:
+                if volume < 50_000:
                     continue
             else:
-                # No current volume yet — require prev day was liquid
-                if prev_vol < MIN_PREV_VOL:
+                if prev_vol < 25_000:
                     continue
 
             candidates.append({
@@ -461,7 +469,22 @@ def score(fvec, models, thresholds):
 _alerted_today = set()
 
 def already_alerted(ticker):
-    return ticker in _alerted_today
+    # Check memory first (fast)
+    if ticker in _alerted_today:
+        return True
+    # Check all alert files (survives deploys)
+    today = date.today().isoformat()
+    for mode in ["premarket", "early_market", "ah", "basecamp"]:
+        f = ALERT_DIR / f"{today}_{mode}.json"
+        if f.exists():
+            try:
+                with open(f) as fp:
+                    if ticker in json.load(fp):
+                        _alerted_today.add(ticker)  # cache it
+                        return True
+            except Exception:
+                pass
+    return False
 
 def mark_alerted(ticker):
     _alerted_today.add(ticker)
@@ -517,19 +540,26 @@ def run_scan(models, feature_cols, thresholds, mode="premarket", use_today_close
     log.info(f"{mode}: {len(candidates)} candidates (gap >= {MIN_GAP*100:.0f}%)")
 
     fired = 0
+    # Sort by model score descending before alerting
+    scored = []
     for snap in candidates:
-        if fired >= 5:  # max 5 alerts per scan
-            break
         ticker = snap["ticker"]
         if already_alerted(ticker):
             continue
-
         details = get_details(ticker)
         fvec    = build_features(snap, details, feature_cols)
         scores, alerts = score(fvec, models, thresholds)
+        if alerts:
+            scored.append((snap, details, scores, alerts))
+    
+    # Sort by seed score descending, take top 3 per scan
+    scored.sort(key=lambda x: x[2].get("seed", 0), reverse=True)
+    scored = scored[:3]
 
-        if not alerts:
-            continue
+    for snap, details, scores, alerts in scored:
+        if fired >= 3:
+            break
+        ticker = snap["ticker"]
 
         alert_type, score_val = alerts[0]
         log_alert(ticker, alert_type, score_val, scores, snap, mode)

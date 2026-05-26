@@ -343,7 +343,19 @@ def get_candidates(use_today_close=False):
             if volume > 0:
                 if volume < 50_000:
                     continue
+                # Volume acceleration — today's volume should be
+                # on track to exceed prev day (annualize current vol)
+                # Market open ~6.5 hours = 390 minutes
+                # If we're 30 min in and have 50k vol = 650k annualized
+                now_et = datetime.now(ET)
+                market_open = now_et.replace(hour=9, minute=30, second=0)
+                minutes_open = max((now_et - market_open).seconds / 60, 1)
+                projected_vol = volume * (390 / minutes_open)
+                vol_ratio = projected_vol / prev_vol if prev_vol > 0 else 1
+                if vol_ratio < 1.5:  # projected volume < 1.5x prev day = weak
+                    continue
             else:
+                # Premarket — use prev day volume as proxy
                 if prev_vol < 25_000:
                     continue
 

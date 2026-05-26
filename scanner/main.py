@@ -217,9 +217,11 @@ def build_watchlist():
             continue
         if close < MIN_PRICE:
             continue
+        if close > 5.00:          # seeds are almost never above $5 prev close
+            continue
         if dollar_vol < MIN_PREV_VOL * close:
             continue
-        # Skip obvious ETFs and funds (usually 4+ chars with patterns)
+        # Skip obvious ETFs and funds
         if len(ticker) > 5:
             continue
 

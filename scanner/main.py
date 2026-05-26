@@ -277,19 +277,29 @@ def get_bulk_candidates(use_today_close=False):
         if volume < MIN_VOLUME:
             continue
 
+        # Get prev close — use our map first, fall back to prevDay.c
+        if prev_close <= 0:
+            prev_close = get_prev_close(ticker)
+        if prev_close <= 0 or prev_close < MIN_PRICE:
+            continue
+
+        # If day.c = 0 (premarket — Polygon hasn't populated day yet)
+        # back-calculate from changePerc which Polygon always provides
+        if pm_close <= 0 and change_perc != 0:
+            pm_close = prev_close * (1 + change_perc / 100)
+            pm_open  = pm_close
+            pm_high  = pm_close
+            pm_low   = pm_close
+
+        if pm_close <= 0:
+            continue
+
         # AH mode — compare to today's close not yesterday's
         if use_today_close:
             today_close = day.get("c", 0) or 0
             ref_price = today_close if today_close > 0 else prev_close
         else:
             ref_price = prev_close
-
-        # If ref_price is 0 (holiday/weekend), fetch real prev close
-        if ref_price <= 0 and pm_close > 0:
-            ref_price = get_prev_close(ticker)
-
-        if ref_price <= 0 or ref_price < MIN_PRICE:
-            continue
 
         # Calculate gap from reference price
         gap = (pm_close - ref_price) / ref_price

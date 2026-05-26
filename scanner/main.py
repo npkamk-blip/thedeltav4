@@ -148,12 +148,38 @@ def poly_get(path, params=None):
         log.debug(f"Polygon error: {e}")
     return None
 
+# ── Get real prev close (handles holidays) ───────────────────
+_prev_close_cache = {}
+
+def get_prev_close(ticker):
+    """
+    Get the most recent valid close price for a ticker.
+    Falls back to fetching daily bars if prevDay.c is 0.
+    """
+    if ticker in _prev_close_cache:
+        return _prev_close_cache[ticker]
+
+    # Walk back up to 5 days to find last valid close
+    check_date = date.today() - timedelta(days=1)
+    for _ in range(5):
+        if check_date.weekday() < 5:  # weekday
+            data = poly_get(f"/v1/open-close/{ticker}/{check_date.isoformat()}")
+            if data and data.get("status") == "OK":
+                close = data.get("close", 0) or 0
+                if close > 0:
+                    _prev_close_cache[ticker] = close
+                    return close
+        check_date -= timedelta(days=1)
+
+    return 0
+
 # ── BULK SNAPSHOT — the key function ─────────────────────────
-def get_bulk_candidates():
+def get_bulk_candidates(use_today_close=False):
     """
     ONE API call → ALL ~8,000 stocks snapshot.
     Filter locally for gap + volume.
     Returns candidates at +5% not +35%.
+    use_today_close=True for AH mode (compare to today close, not yesterday)
     """
     data = poly_get(
         "/v2/snapshot/locale/us/markets/stocks/tickers",
@@ -170,25 +196,39 @@ def get_bulk_candidates():
         day    = t.get("day", {})
         prev   = t.get("prevDay", {})
 
-        prev_close = prev.get("c", 0) or 0
-        pm_close   = day.get("c", 0) or 0
-        pm_open    = day.get("o", 0) or 0
-        pm_high    = day.get("h", 0) or 0
-        pm_low     = day.get("l", 0) or 0
-        volume     = day.get("v", 0) or 0
-        vwap       = day.get("vw", 0) or 0
+        prev_close     = prev.get("c", 0) or 0
+        pm_close       = day.get("c", 0) or 0
+        pm_open        = day.get("o", 0) or 0
+        pm_high        = day.get("h", 0) or 0
+        pm_low         = day.get("l", 0) or 0
+        volume         = day.get("v", 0) or 0
+        vwap           = day.get("vw", 0) or 0
+        change_perc    = t.get("todaysChangePerc", 0) or 0
 
         # Apply filters
-        if prev_close < MIN_PRICE:
-            continue
         if volume < MIN_VOLUME:
             continue
-        if prev_close <= 0:
+
+        # AH mode — compare to today's close not yesterday's
+        if use_today_close:
+            today_close = day.get("c", 0) or 0
+            ref_price = today_close if today_close > 0 else prev_close
+        else:
+            ref_price = prev_close
+
+        # If ref_price is 0 (holiday/weekend), fetch real prev close
+        if ref_price <= 0 and pm_close > 0:
+            ref_price = get_prev_close(ticker)
+
+        if ref_price <= 0 or ref_price < MIN_PRICE:
             continue
 
-        gap = (pm_close - prev_close) / prev_close
+        # Calculate gap from reference price
+        gap = (pm_close - ref_price) / ref_price
         if gap < MIN_GAP:
             continue
+
+        prev_close = ref_price  # use as prev_close for feature building
 
         candidates.append({
             "ticker":     ticker,
@@ -366,8 +406,8 @@ def format_alert(ticker, alert_type, score_val, scores, snap, details, mode=""):
 # ══════════════════════════════════════════════════════════════
 # MAIN SCAN — used for premarket, early market, and AH
 # ══════════════════════════════════════════════════════════════
-def run_scan(models, feature_cols, thresholds, mode="premarket"):
-    candidates = get_bulk_candidates()
+def run_scan(models, feature_cols, thresholds, mode="premarket", use_today_close=False):
+    candidates = get_bulk_candidates(use_today_close=use_today_close)
     log.info(f"{mode}: {len(candidates)} candidates (gap >= {MIN_GAP*100:.0f}%)")
 
     fired = 0
@@ -609,7 +649,8 @@ def main():
         # ── AH: 4PM - 8PM ─────────────────────────────────
         in_ah = hour >= 16 and hour < 20
         if in_ah:
-            fired = run_scan(models, feature_cols, thresholds, "ah")
+            fired = run_scan(models, feature_cols, thresholds, "ah",
+                           use_today_close=True)
             log.info(f"AH scan: {fired} alerts")
             time.sleep(SCAN_INTERVAL)
             continue

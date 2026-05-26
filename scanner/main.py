@@ -148,29 +148,85 @@ def poly_get(path, params=None):
         log.debug(f"Polygon error: {e}")
     return None
 
-# ── Get real prev close (handles holidays) ───────────────────
-_prev_close_cache = {}
+# ── Prev close map — loaded once at 4AM ──────────────────────
+_prev_close_map  = {}   # ticker → prev_close
+_prev_close_date = None # date the map was built for
+
+def get_last_trading_day():
+    """Get the most recent trading day before today."""
+    check = date.today() - timedelta(days=1)
+    holidays = {
+        date(2024,1,1),date(2024,1,15),date(2024,2,19),date(2024,3,29),
+        date(2024,5,27),date(2024,6,19),date(2024,7,4),date(2024,9,2),
+        date(2024,11,28),date(2024,12,25),
+        date(2025,1,1),date(2025,1,9),date(2025,1,20),date(2025,2,17),
+        date(2025,4,18),date(2025,5,26),date(2025,6,19),date(2025,7,4),
+        date(2025,9,1),date(2025,11,27),date(2025,12,25),
+        date(2026,1,1),date(2026,1,19),date(2026,2,16),date(2026,4,3),
+        date(2026,5,26),
+    }
+    for _ in range(7):
+        if check.weekday() < 5 and check not in holidays:
+            return check
+        check -= timedelta(days=1)
+    return check
+
+def load_prev_closes():
+    """
+    ONE API call loads ALL tickers' previous closes.
+    Uses Polygon grouped daily bars for last trading day.
+    Called once at startup and refreshed each new day.
+    """
+    global _prev_close_map, _prev_close_date
+
+    today = date.today()
+    if _prev_close_date == today and _prev_close_map:
+        return  # already loaded for today
+
+    last_day = get_last_trading_day()
+    log.info(f"Loading prev closes from {last_day}...")
+
+    data = poly_get(
+        f"/v2/aggs/grouped/locale/us/market/stocks/{last_day.isoformat()}",
+        {"adjusted": "false"}
+    )
+
+    if not data or "results" not in data:
+        log.warning(f"Could not load grouped daily bars for {last_day}")
+        return
+
+    new_map = {}
+    for bar in data["results"]:
+        ticker = bar.get("T", "")
+        close  = bar.get("c", 0) or 0
+        if ticker and close > 0:
+            new_map[ticker] = close
+
+    _prev_close_map  = new_map
+    _prev_close_date = today
+    log.info(f"Loaded {len(_prev_close_map)} prev closes from {last_day}")
 
 def get_prev_close(ticker):
-    """
-    Get the most recent valid close price for a ticker.
-    Falls back to fetching daily bars if prevDay.c is 0.
-    """
-    if ticker in _prev_close_cache:
-        return _prev_close_cache[ticker]
+    """Get prev close from map. Falls back to individual call if missing."""
+    if not _prev_close_map:
+        load_prev_closes()
 
-    # Walk back up to 5 days to find last valid close
+    close = _prev_close_map.get(ticker, 0)
+    if close > 0:
+        return close
+
+    # Individual fallback for tickers not in grouped bars
     check_date = date.today() - timedelta(days=1)
     for _ in range(5):
-        if check_date.weekday() < 5:  # weekday
-            data = poly_get(f"/v1/open-close/{ticker}/{check_date.isoformat()}")
+        if check_date.weekday() < 5:
+            data = poly_get(
+                f"/v1/open-close/{ticker}/{check_date.isoformat()}"
+            )
             if data and data.get("status") == "OK":
-                close = data.get("close", 0) or 0
-                if close > 0:
-                    _prev_close_cache[ticker] = close
-                    return close
+                c = data.get("close", 0) or 0
+                if c > 0:
+                    return c
         check_date -= timedelta(days=1)
-
     return 0
 
 # ── BULK SNAPSHOT — the key function ─────────────────────────
@@ -354,11 +410,24 @@ def score(fvec, models, thresholds):
 
 # ── Alert tracking ────────────────────────────────────────────
 def already_alerted(ticker, mode="scanner"):
+    """Check if ticker already alerted in ANY window today."""
+    # Check current mode
     f = ALERT_DIR / f"{date.today().isoformat()}_{mode}.json"
-    if not f.exists():
-        return False
-    with open(f) as fp:
-        return ticker in json.load(fp)
+    if f.exists():
+        with open(f) as fp:
+            if ticker in json.load(fp):
+                return True
+
+    # Also check all other windows — don't double alert
+    for m in ["premarket", "early_market", "ah", "basecamp"]:
+        if m == mode:
+            continue
+        f2 = ALERT_DIR / f"{date.today().isoformat()}_{m}.json"
+        if f2.exists():
+            with open(f2) as fp:
+                if ticker in json.load(fp):
+                    return True
+    return False
 
 def log_alert(ticker, alert_type, score_val, scores, snap, mode="scanner"):
     f = ALERT_DIR / f"{date.today().isoformat()}_{mode}.json"
@@ -601,6 +670,9 @@ def main():
         log.error("No models found")
         return
 
+    # Load prev closes immediately at startup
+    load_prev_closes()
+
     morning_summary_sent = False
     nightly_summary_sent = False
     last_basecamp_scan   = None
@@ -619,6 +691,8 @@ def main():
             ticker_cache.clear()
             last_date = now.date()
             log.info(f"New day: {now.date()}")
+            # Load prev closes for the new day — ONE API call
+            load_prev_closes()
 
         # ── 10 PM nightly summary ──────────────────────────
         if hour == 22 and minute < 5 and not nightly_summary_sent:

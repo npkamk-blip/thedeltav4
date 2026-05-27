@@ -64,7 +64,7 @@ for d in [LOG_DIR, ALERT_DIR, DATA_DIR]:
 
 # Universe filters
 MIN_PRICE       = 0.10
-MAX_PRICE       = 2.00
+MAX_PRICE       = 3.00  # raised from 2.00 to catch ASTC-type stocks
 MIN_DOLLAR_VOL  = 25_000
 MAX_WATCHLIST   = 20       # top N to watch each day
 
@@ -426,8 +426,40 @@ def format_alert(ticker, alert_type, score_val, scores, snap, details, mode=""):
 # OVERNIGHT SCORER — builds top 20 watchlist
 # ══════════════════════════════════════════════════════════════
 def get_si_data():
-    """Download FINRA short interest for today."""
+    """
+    Download FINRA short interest data.
+    Tries biweekly short interest first (real SI%)
+    Falls back to daily short volume ratio.
+    """
     today = date.today()
+
+    # Try biweekly FINRA short interest first
+    # Published twice monthly around 1st and 15th
+    check = today
+    for _ in range(30):
+        if check.day in [1,2,3,14,15,16,17] and check.weekday() < 5 and check not in HOLIDAYS:
+            url = f"https://cdn.finra.org/equity/regsho/biweekly/FNRAshvol{check.strftime('%Y%m%d')}.txt"
+            r = edgar_get(url)
+            if r and r.status_code == 200 and len(r.text) > 1000:
+                si_map = {}
+                for line in r.text.strip().split("\n")[1:]:
+                    parts = line.split("|")
+                    if len(parts) >= 2:
+                        sym = parts[0].strip().upper()
+                        try:
+                            short_int = float(parts[1])
+                            avg_vol   = float(parts[2]) if len(parts) > 2 else 0
+                            if avg_vol > 0:
+                                si_map[sym] = round(short_int / avg_vol, 2)
+                        except Exception:
+                            pass
+                if si_map:
+                    log.info(f"Loaded biweekly SI: {len(si_map)} tickers from {check}")
+                    return si_map
+        check -= timedelta(days=1)
+
+    # Fallback: daily short volume ratio
+    log.info("Biweekly SI not found, using daily short volume")
     for delta in range(5):
         check = today - timedelta(days=delta)
         if check.weekday() >= 5 or check in HOLIDAYS:
@@ -447,33 +479,87 @@ def get_si_data():
                             si_map[sym] = round(sv / tv * 100, 2)
                     except Exception:
                         pass
-            log.info(f"Loaded SI data: {len(si_map)} tickers from {check}")
+            log.info(f"Loaded daily SI: {len(si_map)} tickers from {check}")
             return si_map
     return {}
 
 def get_edgar_8k_today():
-    """Get tickers with 8-K filings today or recently."""
+    """
+    Get tickers with 8-K filings in last 7 days.
+    Uses EDGAR full-text search API.
+    Tries multiple field name formats for robustness.
+    """
     today = date.today()
     filings = {}
-    try:
-        r = edgar_get(
-            "https://efts.sec.gov/LATEST/search-index?q=%228-K%22"
-            f"&dateRange=custom&startdt={(today - timedelta(days=3)).isoformat()}"
-            f"&enddt={today.isoformat()}&forms=8-K"
-        )
-        if r and r.status_code == 200:
-            hits = r.json().get("hits", {}).get("hits", [])
-            for hit in hits:
-                src    = hit.get("_source", {})
-                ticker = src.get("ticker", "").strip().upper()
-                filed  = src.get("file_date", "")
-                form   = src.get("form_type", "")
-                if ticker:
-                    if ticker not in filings:
-                        filings[ticker] = []
-                    filings[ticker].append({"filed": filed, "form": form})
-    except Exception as e:
-        log.debug(f"EDGAR error: {e}")
+    
+    # Try multiple date ranges to ensure coverage
+    start_date = (today - timedelta(days=7)).isoformat()
+    end_date   = today.isoformat()
+    
+    urls = [
+        # Primary EDGAR search
+        f"https://efts.sec.gov/LATEST/search-index?q=%228-K%22&dateRange=custom&startdt={start_date}&enddt={end_date}&forms=8-K",
+        # Fallback — EDGAR RSS feed
+        "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&dateb=&owner=include&count=100&search_text=&output=atom",
+    ]
+    
+    for url in urls:
+        try:
+            r = edgar_get(url)
+            if not r or r.status_code != 200:
+                continue
+                
+            # Try JSON first (EFTS search)
+            try:
+                data = r.json()
+                hits = data.get("hits", {}).get("hits", [])
+                if hits:
+                    for hit in hits:
+                        src = hit.get("_source", {})
+                        # Try multiple field names
+                        ticker = (src.get("ticker") or 
+                                 src.get("symbol") or 
+                                 src.get("entity_name") or "").strip().upper()
+                        filed  = (src.get("file_date") or 
+                                 src.get("filed") or 
+                                 src.get("period_of_report") or "")
+                        form   = src.get("form_type", "8-K")
+                        
+                        if ticker and len(ticker) <= 5:
+                            if ticker not in filings:
+                                filings[ticker] = []
+                            filings[ticker].append({"filed": filed, "form": form})
+                    
+                    if filings:
+                        log.info(f"EDGAR: {len(filings)} tickers with recent filings")
+                        return filings
+            except Exception:
+                pass
+                
+            # Try RSS/Atom feed (fallback)
+            try:
+                import xml.etree.ElementTree as ET
+                root = ET.fromstring(r.text)
+                ns = {"atom": "http://www.w3.org/2005/Atom"}
+                entries = root.findall(".//atom:entry", ns)
+                for entry in entries:
+                    title = entry.find("atom:title", ns)
+                    if title is not None and title.text:
+                        # Parse ticker from title like "8-K for BRTX"
+                        parts = title.text.split()
+                        for i, p in enumerate(parts):
+                            if p.upper() in ["FOR", "BY"] and i+1 < len(parts):
+                                ticker = parts[i+1].strip("(),.").upper()
+                                if ticker and len(ticker) <= 5:
+                                    if ticker not in filings:
+                                        filings[ticker] = []
+                                    filings[ticker].append({"filed": today.isoformat(), "form": "8-K"})
+            except Exception:
+                pass
+                
+        except Exception as e:
+            log.debug(f"EDGAR error: {e}")
+    
     log.info(f"EDGAR: {len(filings)} tickers with recent filings")
     return filings
 
@@ -523,7 +609,7 @@ def score_universe():
         open_   = bar.get("o", 0) or 0
         dollar_vol = close * volume
 
-        # Hard filters
+        # Hard filters — pre-filter BEFORE expensive API calls
         if not ticker or len(ticker) > 5:
             continue
         if ticker.endswith("W") or ticker.endswith("R") or "." in ticker:
@@ -532,9 +618,16 @@ def score_universe():
             continue
         if dollar_vol < MIN_DOLLAR_VOL:
             continue
+        # Additional pre-filters to reduce history API calls
+        if volume < 5_000:   # skip illiquid stocks
+            continue
 
         # Get details (float etc) — use cache
         details = get_ticker_details(ticker)
+
+        # Skip if float too large (saves API call)
+        if details.get("float_M", -1) > 100:
+            continue
 
         # Get historical data for 52w features
         hist = poly_get(
@@ -724,6 +817,11 @@ def get_watchlist_snapshots(use_today_close=False):
         pm_high = day.get("h", 0) or pm_close
         pm_low  = day.get("l", 0) or pm_close
         volume  = day.get("v", 0) or min_bar.get("v", 0) or 0
+        # Premarket: day.v and min_bar.v both = 0
+        # Use prevDay.v as proxy for volume activity
+        prev_vol_day = prev.get("v", 0) or 0
+        if volume == 0 and prev_vol_day > 0:
+            volume = prev_vol_day  # use prev day volume as proxy
 
         # Reference price
         ref_price = day.get("c", 0) or prev_close if use_today_close else prev_close
@@ -1082,6 +1180,9 @@ def score_ticker_on_demand(ticker):
         pm_close = prev_close * (1 + change / 100)
 
     volume = day.get("v", 0) or min_bar.get("v", 0) or 0
+    # Premarket fallback — use prevDay volume
+    if volume == 0:
+        volume = prev.get("v", 0) or 0
     gap    = (pm_close - prev_close) / prev_close if prev_close > 0 else 0
 
     details = get_ticker_details(ticker)

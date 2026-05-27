@@ -1,31 +1,22 @@
 """
-THE DELTA v2 — main.py (v5)
+THE DELTA v2 — main.py (v4)
 ============================
 Predictive scanner. Knows BEFORE the move.
 
 Architecture:
-  Midnight:     Overnight scorer — scores ALL candidates
-                using full feature set including AH data
-                Saves top 20 watchlist for tomorrow
-                Picks up any 8-Ks filed today via EDGAR search
-
+  Midnight:     Overnight scorer — scores ALL 2,000 candidates
+                using all 106 features. Saves top 20 watchlist.
+  
   4AM-9:30AM:   Premarket scanner — watches top 20 only
                 Confirms gap + volume → fires alert
-                Uses overnight score as gate (not re-scoring)
-
-  9:30AM-4PM:   Resting — model not trained on live market data
-
-  4PM-8PM:      Resting — midnight scorer captures AH data
-                No AH scanner needed
-
-  8PM-4AM:      Basecamp — EDGAR watch every 10 minutes
-                New 8-K found → price/float filter → XGBoost score
-                High score → Pushover alert (you can enter tonight)
-                No watchlist writes — midnight scorer handles that
-
-  NO live market scanning (9:30AM-4PM)
-  NO AH scanner — midnight scorer incorporates AH data
-  NO watchlist writes from Basecamp — clean separation
+  
+  4PM-8PM:      AH scanner — watches top 20 for AH moves
+                Catches QTEX-style overnight setups
+  
+  8PM-4AM:      Basecamp — EDGAR watch every 10min
+                New 8-K → scores ticker → adds to watchlist
+  
+  NO live market scanning (9:30AM-4PM) — model not trained on it
 
 Test endpoint: GET /test?ticker=QTEX
   → Scores any ticker through all 3 models
@@ -35,6 +26,7 @@ Schedule:
   Midnight:  Overnight score → build top 20 watchlist
   4AM:       Premarket scanner starts
   5AM:       Morning summary
+  4PM:       AH scanner starts
   8PM:       Basecamp starts
   10PM:      Nightly summary
 """
@@ -910,17 +902,6 @@ def run_scan(mode="premarket", use_today_close=False):
 # BASECAMP — EDGAR overnight watch
 # ══════════════════════════════════════════════════════════════
 def run_basecamp():
-    """
-    EDGAR watch — 8PM to 4AM, every 10 minutes.
-    
-    Flow:
-      1. Pull all 8-K filings from today
-      2. Filter: price $0.10-$3.00, float < 100M
-      3. Score through XGBoost seed model
-      4. If score passes threshold → Pushover alert
-      5. No watchlist writes — midnight scorer handles that
-         independently via get_edgar_8k_today()
-    """
     log.info("Basecamp: scanning EDGAR...")
     try:
         r = edgar_get(
@@ -933,14 +914,12 @@ def run_basecamp():
     except Exception:
         return
 
-    log.info(f"Basecamp: {len(hits)} 8-K filings found")
+    log.info(f"Basecamp: {len(hits)} 8-K filings")
     fired = 0
 
     for hit in hits:
         src    = hit.get("_source", {})
         ticker = src.get("ticker", "").strip().upper()
-
-        # Basic ticker validation
         if not ticker or already_alerted(ticker):
             continue
         if len(ticker) > 5 or ticker.endswith("W") or "." in ticker:
@@ -959,23 +938,14 @@ def run_basecamp():
         prev = t.get("prevDay", {})
 
         prev_close = prev.get("c", 0) or 0
-
-        # Price filter — must be in our universe
         if prev_close < MIN_PRICE or prev_close > MAX_PRICE:
-            log.debug(f"Basecamp {ticker}: price ${prev_close:.2f} outside range")
-            continue
-
-        # Get float — skip large caps before expensive scoring
-        details = get_ticker_details(ticker)
-        float_M = details.get("float_M", -1)
-        if float_M > 100:
-            log.debug(f"Basecamp {ticker}: float {float_M:.0f}M too large")
             continue
 
         pm_close = day.get("c", 0) or prev_close
         volume   = day.get("v", 0) or 0
         gap      = (pm_close - prev_close) / prev_close if prev_close > 0 else 0
 
+        details = get_ticker_details(ticker)
         snap = {
             "ticker":     ticker,
             "prev_close": prev_close,
@@ -988,119 +958,257 @@ def run_basecamp():
             "prev_vol":   prev.get("v", 0),
         }
 
-        # EDGAR features — 8-K just filed tonight
         ef = {
             "days_since_last_8k": 0,
             "has_8k_yesterday":   1,
             "has_merger":         1 if "merger" in str(src).lower() else 0,
             "has_fda":            1 if "fda" in str(src).lower() else 0,
-            "has_contract":       1 if "contract" in str(src).lower() else 0,
-            "has_dilution":       1 if "dilut" in str(src).lower() else 0,
         }
 
-        # Score through XGBoost
         fvec = build_features(snap, details, has_8k=1, edgar_features=ef)
         scores, alerts = score_ticker(fvec)
 
-        # Only alert if model scores it highly
-        # No watchlist modification — midnight scorer picks it up
-        # independently via get_edgar_8k_today() search
         if not alerts:
-            log.debug(f"Basecamp {ticker}: scored but below threshold "
-                     f"seed={scores.get('seed',0):.3f}")
             continue
 
         alert_type, score_val = alerts[0]
         log_alert(ticker, alert_type, score_val, scores, snap, "basecamp")
 
         title, msg = format_alert(
-            ticker, alert_type, score_val, scores, snap, details, "8-K tonight"
+            ticker, alert_type, score_val, scores, snap, details, "overnight 8-K"
         )
         priority = 1 if alert_type in ("super", "mega") else 0
         send_pushover(title, msg, alert_type, priority)
+        log.info(f"BASECAMP: {ticker} {alert_type.upper()} score={score_val:.3f}")
 
-        log.info(
-            f"BASECAMP: {ticker} {alert_type.upper()} "
-            f"score={score_val:.3f} "
-            f"float={float_M:.1f}M "
-            f"gap={gap*100:+.1f}%"
-        )
+        # Also add to watchlist for tomorrow
+        if ticker not in [w["ticker"] for w in _watchlist]:
+            _watchlist.append({
+                "ticker":      ticker,
+                "prev_close":  prev_close,
+                "prev_vol":    prev.get("v", 0),
+                "seed_score":  scores.get("seed", 0),
+                "super_score": scores.get("super", 0),
+                "mega_score":  scores.get("mega", 0),
+                "float_M":     details.get("float_M", -1),
+                "si_pct":      -1,
+                "has_8k":      1,
+                "near_52w_low": 0,
+                "ef":          ef,
+                "snap_base":   snap,
+                "details":     details,
+            })
+            log.info(f"Added {ticker} to watchlist from basecamp")
+
         fired += 1
-
-    log.info(f"Basecamp scan complete: {fired} alerts fired")
 
 # ══════════════════════════════════════════════════════════════
 # DAILY VALIDATION — runs at 4PM after market close
 # ══════════════════════════════════════════════════════════════
 def run_daily_validation():
     """
-    Pull today's top gainers from Polygon.
-    Compare against watchlist.
-    Calculate recall — how many seeds did we have on watchlist?
-    Send summary to Pushover.
+    4PM daily training data collector.
+
+    TWO TRAINING PATHS:
+
+    Path 1 — Watchlist Outcomes:
+      For each of today's 20 watchlist stocks
+      Pull intraday high
+      Label hit_seed = 1 if hit 100%+
+      Save features + outcome → training data
+      Improves PRECISION over time
+
+    Path 2 — Gainers Misses:
+      Pull all stocks that hit 100%+ today
+      Find ones NOT on watchlist
+      Pull their features retroactively
+      Label = 1 (they seeded)
+      Save → training data
+      Improves RECALL over time
+
+    Both paths append to training_outcomes.jsonl
+    Weekly retrain uses this growing dataset
     """
-    log.info("Running daily validation...")
+    log.info("Running 4PM daily validation + training data collection...")
 
-    last_day = date.today()
-    data = poly_get(
-        f"/v2/aggs/grouped/locale/us/market/stocks/{last_day.isoformat()}",
-        {"adjusted": "false"}
-    )
-    if not data or "results" not in data:
-        log.warning("Could not load today's bars for validation")
-        return
-
-    # Find all stocks that hit 100%+ today
+    today = date.today()
     wl_tickers = [w["ticker"] for w in _watchlist]
-    seeds_today = []
+    training_records = []
 
-    for bar in data["results"]:
-        ticker = bar.get("T", "")
-        close  = bar.get("c", 0) or 0
-        high   = bar.get("h", 0) or 0
-        open_  = bar.get("o", 0) or 0
-        prev   = bar.get("o", 0) or 0  # use open as proxy if no prev
+    # ── PATH 1: Watchlist Outcomes ────────────────────────────
+    log.info("Path 1: pulling intraday highs for watchlist...")
 
-        # Get prev close from watchlist or skip
-        wl = next((w for w in _watchlist if w["ticker"] == ticker), None)
-        prev_close = wl["prev_close"] if wl else 0
+    if _watchlist:
+        ticker_str = ",".join(wl_tickers)
+        snaps = poly_get(
+            "/v2/snapshot/locale/us/markets/stocks/tickers",
+            {"tickers": ticker_str}
+        )
 
-        if prev_close > 0 and high >= prev_close * 2.0:
-            seeds_today.append(ticker)
+        if snaps and "tickers" in snaps:
+            for t in snaps["tickers"]:
+                ticker     = t.get("ticker", "")
+                day        = t.get("day", {})
+                intraday_high = day.get("h", 0) or 0
 
-    # Calculate recall
-    caught = [t for t in seeds_today if t in wl_tickers]
-    missed = [t for t in seeds_today if t not in wl_tickers]
-    recall = len(caught) / len(seeds_today) if seeds_today else 0
+                wl = next((w for w in _watchlist
+                           if w["ticker"] == ticker), None)
+                if not wl:
+                    continue
 
-    log.info(f"Validation: {len(seeds_today)} seeds today | "
-             f"caught={len(caught)} | missed={len(missed)} | "
-             f"recall={recall:.0%}")
+                prev_close = wl.get("prev_close", 0) or 0
+                if prev_close <= 0:
+                    continue
 
-    # Build message
-    lines = [f"📊 Daily Validation — {last_day}"]
-    lines.append(f"Seeds today: {len(seeds_today)}")
-    lines.append(f"On watchlist: {len(caught)} ({recall:.0%} recall)")
+                actual_pct = ((intraday_high - prev_close)
+                              / prev_close * 100) if prev_close > 0 else 0
+                hit_seed   = 1 if intraday_high >= prev_close * 2.0 else 0
+                hit_super  = 1 if intraday_high >= prev_close * 6.0 else 0
+                hit_mega   = 1 if intraday_high >= prev_close * 11.0 else 0
+
+                record = {
+                    "date":          today.isoformat(),
+                    "ticker":        ticker,
+                    "path":          "watchlist",
+                    "prev_close":    prev_close,
+                    "intraday_high": intraday_high,
+                    "actual_pct":    round(actual_pct, 2),
+                    "hit_seed":      hit_seed,
+                    "hit_super":     hit_super,
+                    "hit_mega":      hit_mega,
+                    "overnight_score": wl.get("seed_score", 0),
+                    "float_M":       wl.get("float_M", -1),
+                    "si_pct":        wl.get("si_pct", -1),
+                    "has_8k":        wl.get("has_8k", 0),
+                    "near_52w_low":  wl.get("near_52w_low", 0),
+                    "features":      wl.get("snap_base", {}),
+                }
+                training_records.append(record)
+                log.info(
+                    f"Path1: {ticker} high={intraday_high:.2f} "
+                    f"pct={actual_pct:.0f}% seed={hit_seed}"
+                )
+
+    # ── PATH 2: Gainers Misses ────────────────────────────────
+    log.info("Path 2: pulling top gainers for miss analysis...")
+
+    gainers = poly_get(
+        "/v2/snapshot/locale/us/markets/stocks/gainers",
+        {"include_otc": "false"}
+    )
+
+    caught  = []
+    missed  = []
+
+    if gainers and "tickers" in gainers:
+        for t in gainers["tickers"]:
+            ticker     = t.get("ticker", "")
+            day        = t.get("day", {})
+            prev       = t.get("prevDay", {})
+            change_pct = t.get("todaysChangePerc", 0) or 0
+
+            if not ticker:
+                continue
+
+            prev_close    = prev.get("c", 0) or 0
+            intraday_high = day.get("h", 0) or 0
+
+            # Only care about stocks in our universe
+            if prev_close < MIN_PRICE or prev_close > MAX_PRICE:
+                continue
+
+            # Only care about actual seeds 100%+
+            if prev_close <= 0:
+                continue
+            if intraday_high < prev_close * 2.0:
+                continue
+
+            actual_pct = ((intraday_high - prev_close)
+                          / prev_close * 100)
+
+            if ticker in wl_tickers:
+                caught.append(ticker)
+            else:
+                missed.append(ticker)
+
+                # Pull features for miss
+                details = get_ticker_details(ticker)
+                float_M = details.get("float_M", -1)
+
+                # Skip if float too large
+                if float_M > 100:
+                    continue
+
+                record = {
+                    "date":          today.isoformat(),
+                    "ticker":        ticker,
+                    "path":          "miss",
+                    "prev_close":    prev_close,
+                    "intraday_high": intraday_high,
+                    "actual_pct":    round(actual_pct, 2),
+                    "hit_seed":      1,
+                    "hit_super":     1 if intraday_high >= prev_close * 6.0 else 0,
+                    "hit_mega":      1 if intraday_high >= prev_close * 11.0 else 0,
+                    "overnight_score": 0,
+                    "float_M":       float_M,
+                    "si_pct":        -1,
+                    "has_8k":        0,
+                    "near_52w_low":  0,
+                    "features":      {
+                        "prev_close": prev_close,
+                        "float_M":    float_M,
+                        "market_cap": details.get("market_cap", -1),
+                    },
+                }
+                training_records.append(record)
+                log.info(
+                    f"Path2 MISS: {ticker} "
+                    f"pct={actual_pct:.0f}% "
+                    f"float={float_M:.1f}M"
+                )
+
+    # ── SAVE TRAINING DATA ────────────────────────────────────
+    if training_records:
+        outcomes_file = DATA_DIR / "training_outcomes.jsonl"
+        with open(outcomes_file, "a") as f:
+            for record in training_records:
+                f.write(json.dumps(record) + "\n")
+        log.info(f"Saved {len(training_records)} training records")
+
+    # ── RECALL CALCULATION ────────────────────────────────────
+    total_seeds = len(caught) + len(missed)
+    recall = len(caught) / total_seeds if total_seeds > 0 else 0
+
+    log.info(
+        f"Validation: {total_seeds} seeds today | "
+        f"caught={len(caught)} | missed={len(missed)} | "
+        f"recall={recall:.0%}"
+    )
+
+    # ── PUSHOVER SUMMARY ──────────────────────────────────────
+    lines = [f"📊 Daily Report — {today}"]
+    lines.append(f"Seeds today: {total_seeds}")
+    lines.append(f"Caught: {len(caught)} ({recall:.0%} recall)")
     if caught:
-        lines.append(f"Caught: {', '.join(caught)}")
+        lines.append(f"✅ {', '.join(caught)}")
     if missed:
-        lines.append(f"Missed: {', '.join(missed[:5])}")
-    if not seeds_today:
-        lines.append("No seeds today")
+        lines.append(f"❌ Missed: {', '.join(missed[:5])}")
+    lines.append(f"Training records saved: {len(training_records)}")
 
     msg = "\n".join(lines)
-    send_pushover("📊 Delta v2 Validation", msg, "seed", priority=0)
+    send_pushover("📊 Delta v2 Daily Report", msg, "seed", priority=0)
 
-    # Save to file for tracking
-    val_file = ALERT_DIR / f"{last_day.isoformat()}_validation.json"
+    # ── SAVE VALIDATION JSON ──────────────────────────────────
+    val_file = ALERT_DIR / f"{today.isoformat()}_validation.json"
     with open(val_file, "w") as f:
         json.dump({
-            "date":        last_day.isoformat(),
-            "seeds_today": seeds_today,
-            "caught":      caught,
-            "missed":      missed,
-            "recall":      round(recall, 3),
-            "watchlist":   wl_tickers,
+            "date":             today.isoformat(),
+            "caught":           caught,
+            "missed":           missed,
+            "recall":           round(recall, 3),
+            "total_seeds":      total_seeds,
+            "training_records": len(training_records),
+            "watchlist":        wl_tickers,
         }, f, indent=2)
 
 # ══════════════════════════════════════════════════════════════
@@ -1371,11 +1479,12 @@ def main():
             except Exception as e:
                 log.error(f"Validation error: {e}")
 
-        # 4PM-8PM — rest between market close and basecamp
-        # Midnight scorer captures AH data independently
-        in_post_market = hour >= 16 and hour < 20
-        if in_post_market:
-            time.sleep(300)
+        # AH: 4PM - 8PM only
+        in_ah = hour >= 16 and hour < 20
+        if in_ah:
+            fired = run_scan("ah", use_today_close=True)
+            log.info(f"AH scan done: {fired} alerts")
+            time.sleep(SCAN_INTERVAL)
             continue
 
         # BASECAMP: 8PM - 4AM

@@ -1,22 +1,31 @@
 """
-THE DELTA v2 — main.py (v4)
+THE DELTA v2 — main.py (v5)
 ============================
 Predictive scanner. Knows BEFORE the move.
 
 Architecture:
-  Midnight:     Overnight scorer — scores ALL 2,000 candidates
-                using all 106 features. Saves top 20 watchlist.
-  
+  Midnight:     Overnight scorer — scores ALL candidates
+                using full feature set including AH data
+                Saves top 20 watchlist for tomorrow
+                Picks up any 8-Ks filed today via EDGAR search
+
   4AM-9:30AM:   Premarket scanner — watches top 20 only
                 Confirms gap + volume → fires alert
-  
-  4PM-8PM:      AH scanner — watches top 20 for AH moves
-                Catches QTEX-style overnight setups
-  
-  8PM-4AM:      Basecamp — EDGAR watch every 10min
-                New 8-K → scores ticker → adds to watchlist
-  
-  NO live market scanning (9:30AM-4PM) — model not trained on it
+                Uses overnight score as gate (not re-scoring)
+
+  9:30AM-4PM:   Resting — model not trained on live market data
+
+  4PM-8PM:      Resting — midnight scorer captures AH data
+                No AH scanner needed
+
+  8PM-4AM:      Basecamp — EDGAR watch every 10 minutes
+                New 8-K found → price/float filter → XGBoost score
+                High score → Pushover alert (you can enter tonight)
+                No watchlist writes — midnight scorer handles that
+
+  NO live market scanning (9:30AM-4PM)
+  NO AH scanner — midnight scorer incorporates AH data
+  NO watchlist writes from Basecamp — clean separation
 
 Test endpoint: GET /test?ticker=QTEX
   → Scores any ticker through all 3 models
@@ -26,7 +35,6 @@ Schedule:
   Midnight:  Overnight score → build top 20 watchlist
   4AM:       Premarket scanner starts
   5AM:       Morning summary
-  4PM:       AH scanner starts
   8PM:       Basecamp starts
   10PM:      Nightly summary
 """
@@ -902,6 +910,17 @@ def run_scan(mode="premarket", use_today_close=False):
 # BASECAMP — EDGAR overnight watch
 # ══════════════════════════════════════════════════════════════
 def run_basecamp():
+    """
+    EDGAR watch — 8PM to 4AM, every 10 minutes.
+    
+    Flow:
+      1. Pull all 8-K filings from today
+      2. Filter: price $0.10-$3.00, float < 100M
+      3. Score through XGBoost seed model
+      4. If score passes threshold → Pushover alert
+      5. No watchlist writes — midnight scorer handles that
+         independently via get_edgar_8k_today()
+    """
     log.info("Basecamp: scanning EDGAR...")
     try:
         r = edgar_get(
@@ -914,12 +933,14 @@ def run_basecamp():
     except Exception:
         return
 
-    log.info(f"Basecamp: {len(hits)} 8-K filings")
+    log.info(f"Basecamp: {len(hits)} 8-K filings found")
     fired = 0
 
     for hit in hits:
         src    = hit.get("_source", {})
         ticker = src.get("ticker", "").strip().upper()
+
+        # Basic ticker validation
         if not ticker or already_alerted(ticker):
             continue
         if len(ticker) > 5 or ticker.endswith("W") or "." in ticker:
@@ -938,14 +959,23 @@ def run_basecamp():
         prev = t.get("prevDay", {})
 
         prev_close = prev.get("c", 0) or 0
+
+        # Price filter — must be in our universe
         if prev_close < MIN_PRICE or prev_close > MAX_PRICE:
+            log.debug(f"Basecamp {ticker}: price ${prev_close:.2f} outside range")
+            continue
+
+        # Get float — skip large caps before expensive scoring
+        details = get_ticker_details(ticker)
+        float_M = details.get("float_M", -1)
+        if float_M > 100:
+            log.debug(f"Basecamp {ticker}: float {float_M:.0f}M too large")
             continue
 
         pm_close = day.get("c", 0) or prev_close
         volume   = day.get("v", 0) or 0
         gap      = (pm_close - prev_close) / prev_close if prev_close > 0 else 0
 
-        details = get_ticker_details(ticker)
         snap = {
             "ticker":     ticker,
             "prev_close": prev_close,
@@ -958,49 +988,46 @@ def run_basecamp():
             "prev_vol":   prev.get("v", 0),
         }
 
+        # EDGAR features — 8-K just filed tonight
         ef = {
             "days_since_last_8k": 0,
             "has_8k_yesterday":   1,
             "has_merger":         1 if "merger" in str(src).lower() else 0,
             "has_fda":            1 if "fda" in str(src).lower() else 0,
+            "has_contract":       1 if "contract" in str(src).lower() else 0,
+            "has_dilution":       1 if "dilut" in str(src).lower() else 0,
         }
 
+        # Score through XGBoost
         fvec = build_features(snap, details, has_8k=1, edgar_features=ef)
         scores, alerts = score_ticker(fvec)
 
+        # Only alert if model scores it highly
+        # No watchlist modification — midnight scorer picks it up
+        # independently via get_edgar_8k_today() search
         if not alerts:
+            log.debug(f"Basecamp {ticker}: scored but below threshold "
+                     f"seed={scores.get('seed',0):.3f}")
             continue
 
         alert_type, score_val = alerts[0]
         log_alert(ticker, alert_type, score_val, scores, snap, "basecamp")
 
         title, msg = format_alert(
-            ticker, alert_type, score_val, scores, snap, details, "overnight 8-K"
+            ticker, alert_type, score_val, scores, snap, details, "8-K tonight"
         )
         priority = 1 if alert_type in ("super", "mega") else 0
         send_pushover(title, msg, alert_type, priority)
-        log.info(f"BASECAMP: {ticker} {alert_type.upper()} score={score_val:.3f}")
 
-        # Also add to watchlist for tomorrow
-        if ticker not in [w["ticker"] for w in _watchlist]:
-            _watchlist.append({
-                "ticker":      ticker,
-                "prev_close":  prev_close,
-                "prev_vol":    prev.get("v", 0),
-                "seed_score":  scores.get("seed", 0),
-                "super_score": scores.get("super", 0),
-                "mega_score":  scores.get("mega", 0),
-                "float_M":     details.get("float_M", -1),
-                "si_pct":      -1,
-                "has_8k":      1,
-                "near_52w_low": 0,
-                "ef":          ef,
-                "snap_base":   snap,
-                "details":     details,
-            })
-            log.info(f"Added {ticker} to watchlist from basecamp")
-
+        log.info(
+            f"BASECAMP: {ticker} {alert_type.upper()} "
+            f"score={score_val:.3f} "
+            f"float={float_M:.1f}M "
+            f"gap={gap*100:+.1f}%"
+        )
         fired += 1
+
+    log.info(f"Basecamp scan complete: {fired} alerts fired")
 
 # ══════════════════════════════════════════════════════════════
 # DAILY VALIDATION — runs at 4PM after market close
@@ -1344,12 +1371,11 @@ def main():
             except Exception as e:
                 log.error(f"Validation error: {e}")
 
-        # AH: 4PM - 8PM only
-        in_ah = hour >= 16 and hour < 20
-        if in_ah:
-            fired = run_scan("ah", use_today_close=True)
-            log.info(f"AH scan done: {fired} alerts")
-            time.sleep(SCAN_INTERVAL)
+        # 4PM-8PM — rest between market close and basecamp
+        # Midnight scorer captures AH data independently
+        in_post_market = hour >= 16 and hour < 20
+        if in_post_market:
+            time.sleep(300)
             continue
 
         # BASECAMP: 8PM - 4AM

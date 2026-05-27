@@ -68,9 +68,9 @@ PUSHOVER_APP_TOKEN = os.environ.get("PUSHOVER_APP_TOKEN", "a3szzncpvgyevbck6z5z5
 EDGAR_USER_AGENT   = "NPKNOB@gmail.com"
 
 MODEL_DIR  = Path(os.environ.get("MODEL_DIR",  "/opt/render/project/src/models"))
-LOG_DIR    = Path(os.environ.get("LOG_DIR",    "/tmp/logs"))
-ALERT_DIR  = Path(os.environ.get("ALERT_DIR",  "/tmp/alerts"))
-DATA_DIR   = Path(os.environ.get("DATA_DIR",   "/tmp/data"))
+LOG_DIR    = Path(os.environ.get("LOG_DIR",    "/data/logs"))
+ALERT_DIR  = Path(os.environ.get("ALERT_DIR",  "/data/alerts"))
+DATA_DIR   = Path(os.environ.get("DATA_DIR",   "/data/data"))
 
 for d in [LOG_DIR, ALERT_DIR, DATA_DIR]:
     d.mkdir(parents=True, exist_ok=True)

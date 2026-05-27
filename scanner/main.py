@@ -993,8 +993,7 @@ def run_daily_validation():
     if not seeds_today:
         lines.append("No seeds today")
 
-    msg = "
-".join(lines)
+    msg = "\n".join(lines)
     send_pushover("📊 Delta v2 Validation", msg, "seed", priority=0)
 
     # Save to file for tracking

@@ -501,22 +501,29 @@ def get_edgar_8k_today():
             f"&enddt={today.isoformat()}&forms=8-K"
         )
         if r and r.status_code == 200:
-            log.info(f"EDGAR response: {len(r.text)} chars")
             hits = r.json().get("hits", {}).get("hits", [])
             log.info(f"EDGAR hits: {len(hits)}")
+
+            import re as _re
             for hit in hits:
                 src    = hit.get("_source", {})
-                # Log first hit to see field names
-                if not filings:
-                    log.info(f"EDGAR sample fields: {list(src.keys())}")
-                ticker = (src.get("ticker") or
-                         src.get("symbol") or "").strip().upper()
-                filed  = (src.get("file_date") or
-                         src.get("filed") or today.isoformat())
+                filed  = src.get("file_date", today.isoformat())
+
+                # display_names format: "Company Name (TICKER, exchange)"
+                ticker = ""
+                display = src.get("display_names", [])
+                for name in (display if isinstance(display, list) else [display]):
+                    match = _re.search(r"\(([A-Z]{1,5})[,)]", str(name))
+                    if match:
+                        ticker = match.group(1)
+                        break
+
                 if ticker and len(ticker) <= 5 and not ticker.endswith("W"):
                     if ticker not in filings:
                         filings[ticker] = []
                     filings[ticker].append({"filed": filed, "form": "8-K"})
+
+            log.info(f"EDGAR: resolved {len(filings)} tickers from {len(hits)} hits")
         else:
             status = r.status_code if r else "no response"
             log.warning(f"EDGAR failed: {status}")

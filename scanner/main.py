@@ -486,80 +486,43 @@ def get_si_data():
 def get_edgar_8k_today():
     """
     Get tickers with 8-K filings in last 7 days.
-    Uses EDGAR full-text search API.
-    Tries multiple field name formats for robustness.
+    Uses exact same URL format as basecamp which works reliably.
     """
     today = date.today()
     filings = {}
-    
-    # Try multiple date ranges to ensure coverage
+
+    # Use same URL pattern as basecamp — proven to work
     start_date = (today - timedelta(days=7)).isoformat()
-    end_date   = today.isoformat()
-    
-    urls = [
-        # Primary EDGAR search
-        f"https://efts.sec.gov/LATEST/search-index?q=%228-K%22&dateRange=custom&startdt={start_date}&enddt={end_date}&forms=8-K",
-        # Fallback — EDGAR RSS feed
-        "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&dateb=&owner=include&count=100&search_text=&output=atom",
-    ]
-    
-    for url in urls:
-        try:
-            r = edgar_get(url)
-            if not r or r.status_code != 200:
-                continue
-                
-            # Try JSON first (EFTS search)
-            try:
-                data = r.json()
-                hits = data.get("hits", {}).get("hits", [])
-                if hits:
-                    for hit in hits:
-                        src = hit.get("_source", {})
-                        # Try multiple field names
-                        ticker = (src.get("ticker") or 
-                                 src.get("symbol") or 
-                                 src.get("entity_name") or "").strip().upper()
-                        filed  = (src.get("file_date") or 
-                                 src.get("filed") or 
-                                 src.get("period_of_report") or "")
-                        form   = src.get("form_type", "8-K")
-                        
-                        if ticker and len(ticker) <= 5:
-                            if ticker not in filings:
-                                filings[ticker] = []
-                            filings[ticker].append({"filed": filed, "form": form})
-                    
-                    if filings:
-                        log.info(f"EDGAR: {len(filings)} tickers with recent filings")
-                        return filings
-            except Exception:
-                pass
-                
-            # Try RSS/Atom feed (fallback)
-            try:
-                import xml.etree.ElementTree as ET
-                root = ET.fromstring(r.text)
-                ns = {"atom": "http://www.w3.org/2005/Atom"}
-                entries = root.findall(".//atom:entry", ns)
-                for entry in entries:
-                    title = entry.find("atom:title", ns)
-                    if title is not None and title.text:
-                        # Parse ticker from title like "8-K for BRTX"
-                        parts = title.text.split()
-                        for i, p in enumerate(parts):
-                            if p.upper() in ["FOR", "BY"] and i+1 < len(parts):
-                                ticker = parts[i+1].strip("(),.").upper()
-                                if ticker and len(ticker) <= 5:
-                                    if ticker not in filings:
-                                        filings[ticker] = []
-                                    filings[ticker].append({"filed": today.isoformat(), "form": "8-K"})
-            except Exception:
-                pass
-                
-        except Exception as e:
-            log.debug(f"EDGAR error: {e}")
-    
+
+    try:
+        r = edgar_get(
+            "https://efts.sec.gov/LATEST/search-index?q=%228-K%22"
+            f"&dateRange=custom&startdt={start_date}"
+            f"&enddt={today.isoformat()}&forms=8-K"
+        )
+        if r and r.status_code == 200:
+            log.info(f"EDGAR response: {len(r.text)} chars")
+            hits = r.json().get("hits", {}).get("hits", [])
+            log.info(f"EDGAR hits: {len(hits)}")
+            for hit in hits:
+                src    = hit.get("_source", {})
+                # Log first hit to see field names
+                if not filings:
+                    log.info(f"EDGAR sample fields: {list(src.keys())}")
+                ticker = (src.get("ticker") or
+                         src.get("symbol") or "").strip().upper()
+                filed  = (src.get("file_date") or
+                         src.get("filed") or today.isoformat())
+                if ticker and len(ticker) <= 5 and not ticker.endswith("W"):
+                    if ticker not in filings:
+                        filings[ticker] = []
+                    filings[ticker].append({"filed": filed, "form": "8-K"})
+        else:
+            status = r.status_code if r else "no response"
+            log.warning(f"EDGAR failed: {status}")
+    except Exception as e:
+        log.warning(f"EDGAR error: {e}")
+
     log.info(f"EDGAR: {len(filings)} tickers with recent filings")
     return filings
 

@@ -69,9 +69,11 @@ MIN_DOLLAR_VOL  = 25_000
 MAX_WATCHLIST   = 20       # top N to watch each day
 
 # Scanner filters (premarket confirmation)
-MIN_GAP         = 0.05     # 5% minimum gap
-MIN_VOLUME      = 50_000   # minimum volume
-MIN_ROOM        = 0.30     # 30% room to seed minimum
+MIN_GAP         = 0.05     # 5% minimum gap — must be activating
+MAX_GAP         = 1.00     # 100% max — already moved = reactive, skip
+MIN_VOLUME      = 10_000   # minimum PM volume
+MIN_ROOM        = 0.20     # 20% room to seed minimum
+MAX_FLOAT_M     = 50.0     # max float — micro/small cap only
 
 # Thresholds
 THRESHOLDS = {"seed": 0.90, "super": 0.80, "mega": 0.70}
@@ -287,6 +289,30 @@ def build_features(snap, details, has_8k=0, edgar_features=None):
             features[k] = v
 
     return np.array([features[col] for col in _feature_cols]).reshape(1, -1)
+
+# ── Setup quality pre-filter ─────────────────────────────────
+def passes_setup_filter(snap, wl):
+    """Hard rules checked BEFORE scoring. Fast rejection of bad setups."""
+    prev    = snap.get("prev_close", 0) or 0
+    price   = snap.get("pm_close", 0) or 0
+    volume  = snap.get("volume", 0) or 0
+    gap     = snap.get("gap_pct", 0) or 0
+    float_M = wl.get("float_M", -1)
+
+    if prev <= 0 or price <= 0:
+        return False, "no price data"
+    if gap < MIN_GAP:
+        return False, f"gap too small ({gap*100:.1f}%)"
+    if gap > MAX_GAP:
+        return False, f"already extended ({gap*100:.0f}%) — reactive"
+    if volume > 0 and volume < MIN_VOLUME:
+        return False, f"PM volume too low ({volume:,.0f})"
+    if float_M > 0 and float_M > MAX_FLOAT_M:
+        return False, f"float too large ({float_M:.0f}M)"
+    room = (prev * 2 - price) / price if price > 0 else 0
+    if room < MIN_ROOM:
+        return False, f"room to seed too small ({room*100:.0f}%)"
+    return True, "ok"
 
 # ── Score ─────────────────────────────────────────────────────
 def score_ticker(fvec):
@@ -560,7 +586,7 @@ def score_universe():
 
         if ticker in edgar_8k:
             filings = edgar_8k[ticker]
-            latest  = min(filings, key=lambda x: x.get("filed", ""))
+            latest  = max(filings, key=lambda x: x.get("filed", ""))  # max = most recent
             try:
                 filed_date = date.fromisoformat(latest["filed"][:10])
                 ef["days_since_last_8k"] = (last_day - filed_date).days
@@ -570,26 +596,33 @@ def score_universe():
 
         # Build snap for feature vector
         snap = {
-            "prev_close":       close,
-            "pm_open":          open_,
-            "pm_high":          high,
-            "pm_low":           low,
-            "pm_close":         close,
-            "volume":           volume,
-            "prev_vol":         volume,
-            "gap_pct":          0,  # no gap yet — overnight score
-            "si_pct":           si_pct,
-            "si_tier":          si_tier,
+            "prev_close":        close,
+            "pm_open":           open_,
+            "pm_high":           high,
+            "pm_low":            low,
+            "pm_close":          close,
+            "volume":            volume,
+            "prev_vol":          volume,
+            "gap_pct":           0,
+            "si_pct":            si_pct,
+            "si_tier":           si_tier,
             "pct_from_52w_high": pct_52w_high,
             "pct_from_52w_low":  pct_52w_low,
-            "near_52w_low":     near_52w_low,
-            "coil_days":        coil,
-            "prev_3d_trend":    trend_3d,
-            "prev_5d_trend":    trend_5d,
-            "avg_volume_20d":   avg_vol_20d,
-            "ah_move_pct":      0,
-            "ah_direction":     0,
-            "ah_volume":        0,
+            "near_52w_low":      near_52w_low,
+            "coil_days":         coil,
+            "prev_3d_trend":     trend_3d,
+            "prev_5d_trend":     trend_5d,
+            "avg_volume_20d":    avg_vol_20d,
+            "ah_move_pct":       0,
+            "ah_direction":      0,
+            "ah_volume":         0,
+            "spy_prev_day_pct":  sector_data.get("SPY", 0),
+            "qqq_prev_day_pct":  sector_data.get("QQQ", 0),
+            "iwm_prev_day_pct":  sector_data.get("IWM", 0),
+            "xbi_prev_day_pct":  sector_data.get("XBI", 0),
+            "market_green":      1 if sector_data.get("SPY", 0) > 0 else 0,
+            "market_red":        1 if sector_data.get("SPY", 0) < 0 else 0,
+            "sector_hot":        1 if sector_data.get("XBI", 0) > 0.01 else 0,
         }
 
         has_8k = 1 if ef["days_since_last_8k"] <= 3 else 0
@@ -725,30 +758,55 @@ def get_watchlist_snapshots(use_today_close=False):
 
 def run_scan(mode="premarket", use_today_close=False):
     candidates = get_watchlist_snapshots(use_today_close)
-    log.info(f"{mode}: {len(candidates)}/{len(_watchlist)} watchlist stocks confirmed")
+    log.info(f"{mode}: {len(candidates)}/{len(_watchlist)} watchlist stocks active")
 
     fired = 0
-    for snap in sorted(candidates, key=lambda x: x["wl_data"].get("seed_score", 0), reverse=True):
+    # Sort by OVERNIGHT score — not live score
+    # Overnight score is clean, predictive, not reactive
+    sorted_candidates = sorted(
+        candidates,
+        key=lambda x: x["wl_data"].get("seed_score", 0),
+        reverse=True
+    )
+
+    for snap in sorted_candidates:
         ticker = snap["ticker"]
         if already_alerted(ticker):
             continue
 
-        wl      = snap["wl_data"]
-        details = wl.get("details", get_ticker_details(ticker))
+        wl = snap["wl_data"]
 
-        # Merge overnight snap with live snap
-        full_snap = {**wl.get("snap_base", {}), **snap}
-        fvec = build_features(
-            full_snap, details,
-            has_8k=wl.get("has_8k", 0),
-            edgar_features=wl.get("ef", {})
-        )
-        scores, alerts = score_ticker(fvec)
-
-        if not alerts:
+        # ── SETUP QUALITY GATE ────────────────────────────────
+        passes, reason = passes_setup_filter(snap, wl)
+        if not passes:
+            log.debug(f"{ticker}: skip — {reason}")
             continue
 
-        alert_type, score_val = alerts[0]
+        # ── USE OVERNIGHT SCORE AS PRIMARY SIGNAL ─────────────
+        # Don't re-score with live data — overnight score is more predictive
+        # Live premarket data already confirmed by passes_setup_filter
+        overnight_seed  = wl.get("seed_score", 0)
+        overnight_super = wl.get("super_score", 0)
+        overnight_mega  = wl.get("mega_score", 0)
+
+        # Determine alert tier from overnight scores only
+        if overnight_mega >= _thresholds.get("mega", 0.70):
+            alert_type, score_val = "mega", overnight_mega
+        elif overnight_super >= _thresholds.get("super", 0.80):
+            alert_type, score_val = "super", overnight_super
+        elif overnight_seed >= _thresholds.get("seed", 0.90):
+            alert_type, score_val = "seed", overnight_seed
+        else:
+            log.debug(f"{ticker}: overnight scores too low — skip")
+            continue
+
+        scores = {
+            "seed":  overnight_seed,
+            "super": overnight_super,
+            "mega":  overnight_mega,
+        }
+
+        details = wl.get("details", get_ticker_details(ticker))
         log_alert(ticker, alert_type, score_val, scores, snap, mode)
 
         title, msg = format_alert(
@@ -757,10 +815,16 @@ def run_scan(mode="premarket", use_today_close=False):
         priority = 1 if alert_type in ("super", "mega") else 0
         send_pushover(title, msg, alert_type, priority)
 
+        gap  = snap.get("gap_pct", 0) * 100
+        vol  = snap.get("volume", 0)
+        prev = snap.get("prev_close", 0)
+        pm   = snap.get("pm_close", 0)
+        room = (prev * 2 - pm) / pm * 100 if pm > 0 else 0
+
         log.info(
             f"ALERT [{mode}]: {ticker} {alert_type.upper()} "
-            f"score={score_val:.3f} gap={snap['gap_pct']*100:+.1f}% "
-            f"vol={snap['volume']:,.0f} room={((snap['prev_close']*2-snap['pm_close'])/snap['pm_close']*100):+.1f}%"
+            f"overnight={score_val:.3f} gap={gap:+.1f}% "
+            f"vol={vol:,.0f} room={room:+.1f}%"
         )
         fired += 1
 
@@ -869,6 +933,81 @@ def run_basecamp():
             log.info(f"Added {ticker} to watchlist from basecamp")
 
         fired += 1
+
+# ══════════════════════════════════════════════════════════════
+# DAILY VALIDATION — runs at 4PM after market close
+# ══════════════════════════════════════════════════════════════
+def run_daily_validation():
+    """
+    Pull today's top gainers from Polygon.
+    Compare against watchlist.
+    Calculate recall — how many seeds did we have on watchlist?
+    Send summary to Pushover.
+    """
+    log.info("Running daily validation...")
+
+    last_day = date.today()
+    data = poly_get(
+        f"/v2/aggs/grouped/locale/us/market/stocks/{last_day.isoformat()}",
+        {"adjusted": "false"}
+    )
+    if not data or "results" not in data:
+        log.warning("Could not load today's bars for validation")
+        return
+
+    # Find all stocks that hit 100%+ today
+    wl_tickers = [w["ticker"] for w in _watchlist]
+    seeds_today = []
+
+    for bar in data["results"]:
+        ticker = bar.get("T", "")
+        close  = bar.get("c", 0) or 0
+        high   = bar.get("h", 0) or 0
+        open_  = bar.get("o", 0) or 0
+        prev   = bar.get("o", 0) or 0  # use open as proxy if no prev
+
+        # Get prev close from watchlist or skip
+        wl = next((w for w in _watchlist if w["ticker"] == ticker), None)
+        prev_close = wl["prev_close"] if wl else 0
+
+        if prev_close > 0 and high >= prev_close * 2.0:
+            seeds_today.append(ticker)
+
+    # Calculate recall
+    caught = [t for t in seeds_today if t in wl_tickers]
+    missed = [t for t in seeds_today if t not in wl_tickers]
+    recall = len(caught) / len(seeds_today) if seeds_today else 0
+
+    log.info(f"Validation: {len(seeds_today)} seeds today | "
+             f"caught={len(caught)} | missed={len(missed)} | "
+             f"recall={recall:.0%}")
+
+    # Build message
+    lines = [f"📊 Daily Validation — {last_day}"]
+    lines.append(f"Seeds today: {len(seeds_today)}")
+    lines.append(f"On watchlist: {len(caught)} ({recall:.0%} recall)")
+    if caught:
+        lines.append(f"Caught: {', '.join(caught)}")
+    if missed:
+        lines.append(f"Missed: {', '.join(missed[:5])}")
+    if not seeds_today:
+        lines.append("No seeds today")
+
+    msg = "
+".join(lines)
+    send_pushover("📊 Delta v2 Validation", msg, "seed", priority=0)
+
+    # Save to file for tracking
+    val_file = ALERT_DIR / f"{last_day.isoformat()}_validation.json"
+    with open(val_file, "w") as f:
+        json.dump({
+            "date":        last_day.isoformat(),
+            "seeds_today": seeds_today,
+            "caught":      caught,
+            "missed":      missed,
+            "recall":      round(recall, 3),
+            "watchlist":   wl_tickers,
+        }, f, indent=2)
 
 # ══════════════════════════════════════════════════════════════
 # SUMMARIES
@@ -1069,11 +1208,12 @@ def main():
     except Exception as e:
         log.error(f"Overnight scorer failed: {e}")
 
-    morning_summary_sent = False
-    nightly_summary_sent = False
-    last_basecamp_scan   = None
-    last_score_date      = date.today()
-    last_date            = None
+    morning_summary_sent      = False
+    nightly_summary_sent      = False
+    confirmation_score_sent   = False
+    last_basecamp_scan        = None
+    last_score_date           = date.today()
+    last_date                 = None
 
     while True:
         now    = datetime.now(ET)
@@ -1082,9 +1222,10 @@ def main():
 
         # Reset daily state at midnight
         if last_date != now.date():
-            morning_summary_sent = False
-            nightly_summary_sent = False
-            last_basecamp_scan   = None
+            morning_summary_sent    = False
+            nightly_summary_sent    = False
+            confirmation_score_sent = False
+            last_basecamp_scan      = None
             _alerted.clear()
             _ticker_cache.clear()
             last_date = now.date()
@@ -1109,6 +1250,15 @@ def main():
             send_morning_summary()
             morning_summary_sent = True
 
+        # 6:30AM confirmation window — one-time deep scan
+        # Most predictive window: gap established, not yet fully played
+        in_confirmation = hour == 6 and 30 <= minute <= 59
+        if in_confirmation and not confirmation_score_sent:
+            log.info("6:30AM confirmation window — running focused scan")
+            fired = run_scan("premarket_confirmation")
+            log.info(f"Confirmation scan: {fired} alerts")
+            confirmation_score_sent = True
+
         # PREMARKET: 4AM - 9:30AM only
         in_premarket = hour >= 4 and (hour < 9 or (hour == 9 and minute < 30))
         if in_premarket:
@@ -1116,6 +1266,13 @@ def main():
             log.info(f"Premarket scan done: {fired} alerts")
             time.sleep(SCAN_INTERVAL)
             continue
+
+        # 4PM daily validation — how many seeds did we catch?
+        if hour == 16 and minute < 5:
+            try:
+                run_daily_validation()
+            except Exception as e:
+                log.error(f"Validation error: {e}")
 
         # AH: 4PM - 8PM only
         in_ah = hour >= 16 and hour < 20

@@ -164,23 +164,22 @@ def get_cached_tickers() -> list[str]:
 
 
 # ─────────────────────────────────────────────
-# BUILD DAILY UNIVERSE
+# BUILD DAILY UNIVERSE — CHUNKED FOR LOW MEMORY
 # ─────────────────────────────────────────────
-def build_daily_snapshots(tickers: list[str], trading_days: list[date]) -> dict:
+CHUNK_SIZE = 300  # process 300 tickers at a time to stay under 512MB
+
+def process_ticker_chunk(
+    tickers: list[str],
+    trading_days: list[date],
+    chunk_idx: int,
+) -> dict:
     """
-    For each trading day build a snapshot of all stocks:
-    {date: {ticker: {prev_close, day_high, day_volume, float_M, dollar_vol}}}
-    
-    This is the core data structure for seed discovery.
-    Memory efficient — process in chunks.
+    Process one chunk of tickers.
+    Returns partial daily_universe for this chunk only.
+    Frees memory immediately after.
     """
-    log.info(f"Building daily snapshots for {len(tickers)} tickers × {len(trading_days)} days...")
-    
-    # date → list of {ticker, prev_close, day_high, day_volume, float_M}
-    daily_universe: dict[date, list[dict]] = {d: [] for d in trading_days}
-    
-    date_set = set(trading_days)
-    
+    partial: dict[date, list[dict]] = {d: [] for d in trading_days}
+
     for i, ticker in enumerate(tickers):
         daily_df = load_daily_bars(ticker)
         if daily_df is None or daily_df.empty:
@@ -189,19 +188,16 @@ def build_daily_snapshots(tickers: list[str], trading_days: list[date]) -> dict:
         daily_df = daily_df.sort_values("date").reset_index(drop=True)
         float_M  = float(daily_df["float_M"].iloc[0]) if "float_M" in daily_df.columns else -1
 
-        # Loop through dates efficiently
         dates_in_df = set(daily_df["date"].tolist())
 
         for trade_date in trading_days:
             if trade_date not in dates_in_df:
                 continue
 
-            # Get today's bar
             today_rows = daily_df[daily_df["date"] == trade_date]
             if today_rows.empty:
                 continue
 
-            # Get T-1 bar
             past_rows = daily_df[daily_df["date"] < trade_date]
             if past_rows.empty:
                 continue
@@ -209,13 +205,12 @@ def build_daily_snapshots(tickers: list[str], trading_days: list[date]) -> dict:
             today_row  = today_rows.iloc[-1]
             prev_row   = past_rows.iloc[-1]
 
-            prev_close  = float(prev_row.get("close", 0) or 0)
-            prev_vol    = float(prev_row.get("volume", 0) or 0)
-            day_high    = float(today_row.get("high", 0) or 0)
-            day_volume  = float(today_row.get("volume", 0) or 0)
-            dollar_vol  = prev_close * prev_vol
+            prev_close = float(prev_row.get("close", 0) or 0)
+            prev_vol   = float(prev_row.get("volume", 0) or 0)
+            day_high   = float(today_row.get("high", 0) or 0)
+            day_volume = float(today_row.get("volume", 0) or 0)
+            dollar_vol = prev_close * prev_vol
 
-            # Apply loose universe filter
             if prev_close < MIN_PRICE or prev_close > MAX_PRICE:
                 continue
             if dollar_vol < MIN_DOLLAR_VOL:
@@ -223,7 +218,7 @@ def build_daily_snapshots(tickers: list[str], trading_days: list[date]) -> dict:
             if day_volume < MIN_LABEL_VOLUME:
                 continue
 
-            daily_universe[trade_date].append({
+            partial[trade_date].append({
                 "ticker":     ticker,
                 "prev_close": prev_close,
                 "prev_vol":   prev_vol,
@@ -233,12 +228,105 @@ def build_daily_snapshots(tickers: list[str], trading_days: list[date]) -> dict:
                 "dollar_vol": dollar_vol,
             })
 
-        if (i + 1) % 500 == 0:
-            log.info(f"Snapshot progress: {i+1}/{len(tickers)} tickers")
-            gc.collect()
+    return partial
 
-    log.info("Daily snapshots built")
-    return daily_universe
+
+def build_daily_snapshots_chunked(
+    tickers: list[str],
+    trading_days: list[date],
+) -> tuple[dict, dict, dict]:
+    """
+    Process tickers in chunks of CHUNK_SIZE to stay under 512MB RAM.
+    Finds seeds per chunk, accumulates results, frees memory between chunks.
+    
+    Returns seed_registry, seed_details, nonseed_by_date directly
+    instead of building the full universe in memory first.
+    """
+    log.info(f"Building snapshots in chunks of {CHUNK_SIZE} (memory efficient)")
+    log.info(f"Total: {len(tickers)} tickers × {len(trading_days)} days")
+
+    # Accumulators
+    seed_registry:   dict[str, list[str]]       = {}
+    seed_details:    dict[str, dict]             = {}
+    nonseed_by_date: dict[str, list[dict]]       = {}
+
+    total_seeds  = 0
+    total_supers = 0
+    n_chunks     = (len(tickers) + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+    for chunk_idx in range(n_chunks):
+        chunk_start = chunk_idx * CHUNK_SIZE
+        chunk_end   = min(chunk_start + CHUNK_SIZE, len(tickers))
+        chunk       = tickers[chunk_start:chunk_end]
+
+        log.info(f"Chunk {chunk_idx+1}/{n_chunks} | tickers {chunk_start}-{chunk_end}")
+
+        # Process this chunk
+        partial = process_ticker_chunk(chunk, trading_days, chunk_idx)
+
+        # Find seeds in this chunk's data
+        for trade_date, stocks in partial.items():
+            if not stocks:
+                continue
+
+            date_str = trade_date.isoformat()
+
+            for stock in stocks:
+                ticker     = stock["ticker"]
+                prev_close = stock["prev_close"]
+                day_high   = stock["day_high"]
+
+                if prev_close <= 0:
+                    continue
+
+                ratio = day_high / prev_close
+
+                if ratio >= SEED_MULT:
+                    seed_type = "super" if ratio >= SUPER_MULT else "seed"
+                    if seed_type == "super":
+                        total_supers += 1
+                    else:
+                        total_seeds += 1
+
+                    if date_str not in seed_registry:
+                        seed_registry[date_str]   = []
+                        seed_details[date_str]    = {}
+
+                    seed_registry[date_str].append(ticker)
+                    seed_details[date_str][ticker] = {
+                        "ticker":     ticker,
+                        "type":       seed_type,
+                        "prev_close": prev_close,
+                        "day_high":   day_high,
+                        "pct":        round((ratio - 1) * 100, 1),
+                        "float_M":    stock["float_M"],
+                        "dollar_vol": stock["dollar_vol"],
+                    }
+                    log.debug(f"SEED {date_str}: {ticker} {seed_type} +{(ratio-1)*100:.0f}%")
+                else:
+                    # Non-seed — keep for control selection
+                    if date_str not in nonseed_by_date:
+                        nonseed_by_date[date_str] = []
+                    nonseed_by_date[date_str].append(stock)
+
+        # Free chunk memory immediately
+        del partial
+        gc.collect()
+
+    # Log seed days found
+    for date_str, tickers_list in sorted(seed_registry.items()):
+        log.info(f"{date_str}: {len(tickers_list)} seeds — {tickers_list}")
+
+    log.info("=" * 50)
+    log.info("SEED DISCOVERY COMPLETE")
+    log.info(f"Total seed days:  {len(seed_registry)}")
+    log.info(f"Total seeds:      {total_seeds}")
+    log.info(f"Total supers:     {total_supers}")
+    log.info(f"Total events:     {total_seeds + total_supers}")
+    log.info(f"Avg seeds/day:    {(total_seeds+total_supers)/max(len(seed_registry),1):.1f}")
+    log.info("=" * 50)
+
+    return seed_registry, seed_details, nonseed_by_date
 
 
 # ─────────────────────────────────────────────
@@ -535,19 +623,14 @@ def main():
     trading_days = get_trading_days(START_DATE, END_DATE)
     log.info(f"Trading days: {len(trading_days)}")
 
-    # Step 3 — Build daily snapshots
-    daily_universe = build_daily_snapshots(tickers, trading_days)
-
-    # Step 4 — Discover seeds
-    seed_registry, seed_details, nonseed_by_date = discover_seeds(daily_universe)
+    # Step 3 — Build snapshots + discover seeds in chunks (memory efficient)
+    seed_registry, seed_details, nonseed_by_date = build_daily_snapshots_chunked(
+        tickers, trading_days
+    )
 
     if not seed_registry:
         log.error("FAIL | no seeds found — check data collection")
         return
-
-    # Free memory
-    del daily_universe
-    gc.collect()
 
     # Step 5 — Select same-day controls
     control_registry = select_controls(seed_details, nonseed_by_date)

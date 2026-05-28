@@ -36,9 +36,8 @@ START_DATE = date(2025, 1, 1)
 END_DATE   = date(2026, 5, 23)
 
 # Seed thresholds
-SEED_MULT  = 2.00
-SUPER_MULT = 6.00
-MEGA_MULT  = 11.00
+SEED_MULT  = 2.00   # 100% gain (2x prev_close)
+SUPER_MULT = 3.50   # 250% gain (3.5x prev_close)
 
 # Universe filters — same as collector
 MIN_PRICE        = 0.10
@@ -47,7 +46,8 @@ MIN_DOLLAR_VOL   = 10_000  # looser than main scanner to catch quiet seeds
 MIN_LABEL_VOLUME = 25_000
 
 # Control selection
-CONTROLS_PER_SEED    = 3
+SEED_CONTROLS        = 5
+SUPER_CONTROLS       = 4
 FLOAT_RANGE_FACTOR   = 3.0   # control float within 3x of seed float
 PRICE_RANGE_FACTOR   = 3.0   # control price within 3x of seed price
 
@@ -259,7 +259,6 @@ def discover_seeds(daily_universe: dict) -> tuple[dict, dict, dict]:
 
     total_seeds  = 0
     total_supers = 0
-    total_megas  = 0
 
     for trade_date, stocks in daily_universe.items():
         if not stocks:
@@ -281,10 +280,7 @@ def discover_seeds(daily_universe: dict) -> tuple[dict, dict, dict]:
 
             if ratio >= SEED_MULT:
                 seed_type = "seed"
-                if ratio >= MEGA_MULT:
-                    seed_type = "mega"
-                    total_megas += 1
-                elif ratio >= SUPER_MULT:
+                if ratio >= SUPER_MULT:
                     seed_type = "super"
                     total_supers += 1
                 else:
@@ -314,7 +310,6 @@ def discover_seeds(daily_universe: dict) -> tuple[dict, dict, dict]:
     log.info(f"Total seed days:  {len(seed_registry)}")
     log.info(f"Total seeds:      {total_seeds}")
     log.info(f"Total supers:     {total_supers}")
-    log.info(f"Total megas:      {total_megas}")
     log.info(f"Total events:     {total_seeds + total_supers + total_megas}")
     log.info(f"Avg seeds/day:    {(total_seeds+total_supers+total_megas)/max(len(seed_registry),1):.1f}")
     log.info(f"=" * 50)
@@ -353,7 +348,8 @@ def select_controls(
         for seed_ticker, seed_info in seed_tickers.items():
             seed_float = seed_info["float_M"]
             seed_price = seed_info["prev_close"]
-            total_controls_needed += CONTROLS_PER_SEED
+            n_ctrl = SUPER_CONTROLS if seed_info.get("type") == "super" else SEED_CONTROLS
+            total_controls_needed += n_ctrl
 
             # Find similar non-seeds
             candidates = []
@@ -392,8 +388,9 @@ def select_controls(
                 candidates.append((ns["ticker"], similarity))
 
             # Sort by similarity, take top N
+            n_controls = SUPER_CONTROLS if seed_info["type"] == "super" else SEED_CONTROLS
             candidates.sort(key=lambda x: x[1], reverse=True)
-            selected = [t for t, _ in candidates[:CONTROLS_PER_SEED]]
+            selected = [t for t, _ in candidates[:n_controls]]
 
             if not selected:
                 log.warning(
@@ -451,7 +448,7 @@ def build_stats(
     """Build summary statistics for validation."""
 
     # Seed type breakdown
-    type_counts = {"seed": 0, "super": 0, "mega": 0}
+    type_counts = {"seed": 0, "super": 0}
     float_buckets = {"nano(<5M)": 0, "micro(5-15M)": 0, "small(15-50M)": 0, "mid(50M+)": 0, "unknown": 0}
     
     all_seeds = []
@@ -496,7 +493,7 @@ def build_stats(
             f"{s['ticker']} +{s['pct']}% ({s['type']}) float={s['float_M']:.1f}M {s.get('date','')}"
             for s in top_seeds
         ],
-        "controls_needed":     total_seeds_needing_controls * CONTROLS_PER_SEED,
+        "controls_needed":     total_controls_needed,
         "controls_assigned":   total_controls_assigned,
         "pm_1min_candidates":  len(pm_candidates),
         "date_range":          f"{START_DATE} → {END_DATE}",

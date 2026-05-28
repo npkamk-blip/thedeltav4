@@ -581,7 +581,7 @@ def build_stats(
             f"{s['ticker']} +{s['pct']}% ({s['type']}) float={s['float_M']:.1f}M {s.get('date','')}"
             for s in top_seeds
         ],
-        "controls_needed":     total_controls_needed,
+        "controls_needed":     total_controls_assigned,
         "controls_assigned":   total_controls_assigned,
         "pm_1min_candidates":  len(pm_candidates),
         "date_range":          f"{START_DATE} → {END_DATE}",
@@ -642,10 +642,7 @@ def main():
     # Step 6 — Build PM 1-min candidates list
     pm_candidates = build_pm_candidates(seed_registry, control_registry)
 
-    # Step 7 — Build stats
-    stats = build_stats(seed_registry, seed_details, control_registry, pm_candidates)
-
-    # Step 8 — Save everything
+    # Step 7 — Save everything FIRST before stats
     log.info("Saving outputs...")
 
     with open(OUTPUT_DIR / "seed_registry.json", "w") as f:
@@ -663,6 +660,9 @@ def main():
     with open(OUTPUT_DIR / "pm_1min_candidates.json", "w") as f:
         json.dump(pm_candidates, f, indent=2)
     log.info(f"Saved pm_1min_candidates.json ({len(pm_candidates)} tickers)")
+
+    # Step 8 — Build stats
+    stats = build_stats(seed_registry, seed_details, control_registry, pm_candidates)
 
     with open(OUTPUT_DIR / "seed_stats.json", "w") as f:
         json.dump(stats, f, indent=2)

@@ -110,14 +110,13 @@ def get_ticker_details(ticker):
         r = data["results"]
         shares  = r.get("share_class_shares_outstanding", 0) or 0
         float_M = shares / 1_000_000 if shares else -1
-        # Match training code string values exactly
-        ft = "unknown"
+        ft = -1
         if float_M > 0:
-            if float_M < 5:     ft = "nano"
-            elif float_M < 15:  ft = "micro"
-            elif float_M < 50:  ft = "small"
-            elif float_M < 200: ft = "mid"
-            else:               ft = "large"
+            if float_M < 5:     ft = 0
+            elif float_M < 15:  ft = 1
+            elif float_M < 50:  ft = 2
+            elif float_M < 200: ft = 3
+            else:               ft = 4
         locale     = r.get("locale", "us").lower()
         addr       = r.get("address", {})
         hq_country = addr.get("country", "us").lower() if isinstance(addr, dict) else "us"
@@ -185,14 +184,14 @@ def build_features(snap, details, has_8k=0, edgar_features=None):
     float_shares = details.get("float_shares", 0) or 0
     float_rotation_prev = (avg_vol_20d * prev_close / float_shares) if float_shares > 0 and prev_close > 0 and avg_vol_20d > 0 else 0
 
-    # SI — match training string tiers exactly
+    # SI — integer encoding matching XGBoost training
     si_pct  = snap.get("si_pct", -1)
-    si_tier = "unknown"
+    si_tier = -1
     if si_pct is not None and si_pct >= 0:
-        if si_pct < 5:    si_tier = "low"
-        elif si_pct < 15: si_tier = "medium"
-        elif si_pct < 30: si_tier = "high"
-        else:             si_tier = "extreme"
+        if si_pct < 5:    si_tier = 0
+        elif si_pct < 15: si_tier = 1
+        elif si_pct < 30: si_tier = 2
+        else:             si_tier = 3
 
     # EDGAR — all fields from training
     has_8k_val          = has_8k
@@ -298,7 +297,7 @@ def build_features(snap, details, has_8k=0, edgar_features=None):
         # Float
         "float_shares":         float_shares,
         "float_M":              details.get("float_M", -1),
-        "float_tier":           details.get("float_tier", "unknown"),
+        "float_tier":           details.get("float_tier", -1),
         "market_cap":           details.get("market_cap", -1),
         "is_foreign_listed":    details.get("is_foreign_listed", 0),
         "float_rotation_prev":  float_rotation_prev,
@@ -728,12 +727,12 @@ def score_universe():
 
         # ── SI features ───────────────────────────────────────
         si_pct  = si_map.get(ticker, -1)
-        si_tier = "unknown"
+        si_tier = -1
         if si_pct >= 0:
-            if si_pct < 5:    si_tier = "low"
-            elif si_pct < 15: si_tier = "medium"
-            elif si_pct < 30: si_tier = "high"
-            else:             si_tier = "extreme"
+            if si_pct < 5:    si_tier = 0
+            elif si_pct < 15: si_tier = 1
+            elif si_pct < 30: si_tier = 2
+            else:             si_tier = 3
 
         # ── EDGAR features ────────────────────────────────────
         ef = {

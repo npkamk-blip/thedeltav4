@@ -104,25 +104,30 @@ def get_ticker_details(ticker):
     if ticker in _ticker_cache:
         return _ticker_cache[ticker]
     data = poly_get(f"/v3/reference/tickers/{ticker}")
-    details = {"float_shares": -1, "float_M": -1, "float_tier": -1,
+    details = {"float_shares": -1, "float_M": -1, "float_tier": "unknown",
                "market_cap": -1, "is_foreign_listed": 0}
     if data and "results" in data:
         r = data["results"]
         shares  = r.get("share_class_shares_outstanding", 0) or 0
         float_M = shares / 1_000_000 if shares else -1
-        ft = -1
+        # Match training code string values exactly
+        ft = "unknown"
         if float_M > 0:
-            if float_M < 5:     ft = 0
-            elif float_M < 15:  ft = 1
-            elif float_M < 50:  ft = 2
-            elif float_M < 200: ft = 3
-            else:               ft = 4
+            if float_M < 5:     ft = "nano"
+            elif float_M < 15:  ft = "micro"
+            elif float_M < 50:  ft = "small"
+            elif float_M < 200: ft = "mid"
+            else:               ft = "large"
+        locale     = r.get("locale", "us").lower()
+        addr       = r.get("address", {})
+        hq_country = addr.get("country", "us").lower() if isinstance(addr, dict) else "us"
+        is_foreign = 1 if (locale != "us" or hq_country not in ("us", "usa", "united states", "")) else 0
         details = {
             "float_shares":      shares,
             "float_M":           float_M,
             "float_tier":        ft,
             "market_cap":        r.get("market_cap", -1) or -1,
-            "is_foreign_listed": 1 if r.get("locale", "us") != "us" else 0,
+            "is_foreign_listed": is_foreign,
         }
     _ticker_cache[ticker] = details
     return details
@@ -144,69 +149,214 @@ def load_models():
             _thresholds.update(json.load(f))
 def build_features(snap, details, has_8k=0, edgar_features=None):
     ef = edgar_features or {}
-    prev_close = snap.get("prev_close", 0) or 0
-    pm_open    = snap.get("pm_open", 0) or 0
-    pm_high    = snap.get("pm_high", 0) or 0
-    pm_low     = snap.get("pm_low", 0) or 0
-    pm_close   = snap.get("pm_close", 0) or prev_close
-    volume     = snap.get("volume", 0) or 0
-    gap_pct    = snap.get("gap_pct", 0) or 0
-    prev_vol   = snap.get("prev_vol", 0) or 0
+    prev_close  = snap.get("prev_close", 0) or 0
+    pm_open     = snap.get("pm_open", 0) or 0
+    pm_high     = snap.get("pm_high", 0) or 0
+    pm_low      = snap.get("pm_low", 0) or 0
+    pm_close    = snap.get("pm_close", 0) or prev_close
+    volume      = snap.get("pm_volume", 0) or snap.get("volume", 0) or 0
+    gap_pct     = snap.get("pm_gap_pct", 0) or snap.get("gap_pct", 0) or 0
+    prev_vol    = snap.get("prev_volume", 0) or snap.get("prev_vol", 0) or 0
+    avg_vol_20d = snap.get("avg_volume_20d", 0) or 0
+
+    # PM derived
     pm_move_pct = (pm_high - pm_open) / pm_open if pm_open > 0 else 0
-    seed_tgt  = prev_close * 2.0
-    super_tgt = prev_close * 6.0
-    mega_tgt  = prev_close * 11.0
-    rem_seed  = (seed_tgt  - pm_close) / pm_close if pm_close > 0 else 0
-    rem_super = (super_tgt - pm_close) / pm_close if pm_close > 0 else 0
-    rem_mega  = (mega_tgt  - pm_close) / pm_close if pm_close > 0 else 0
-    vol_ratio = volume / prev_vol if prev_vol > 0 and volume > 0 else 0
+    seed_tgt    = prev_close * 2.0
+    super_tgt   = prev_close * 6.0
+    mega_tgt    = prev_close * 11.0
+    rem_seed    = (seed_tgt  - pm_close) / pm_close if pm_close > 0 else 0
+    rem_super   = (super_tgt - pm_close) / pm_close if pm_close > 0 else 0
+    rem_mega    = (mega_tgt  - pm_close) / pm_close if pm_close > 0 else 0
+    pm_vol_ratio = volume / avg_vol_20d if avg_vol_20d > 0 and volume > 0 else 0
+    vol_ratio_prev = prev_vol / avg_vol_20d if avg_vol_20d > 0 and prev_vol > 0 else 0
+    pm_volume_build = snap.get("pm_volume_build", 0) or 0
+
+    # T-1 price structure — match training calc exactly
+    prev_open  = snap.get("prev_open", 0) or 0
+    prev_high  = snap.get("prev_high", 0) or 0
+    prev_low   = snap.get("prev_low", 0) or 0
+    prev_dollar_vol = prev_close * prev_vol if prev_close > 0 and prev_vol > 0 else 0
+    prev_body_pct = abs(prev_close - prev_open) / prev_open if prev_open > 0 else 0
+    total_range = prev_high - prev_low
+    body = abs(prev_close - prev_open)
+    prev_wick_ratio = 1 - (body / total_range) if total_range > 0 else 0
+
+    # Float rotation — float_M denominator in training used float_shares
+    float_shares = details.get("float_shares", 0) or 0
+    float_rotation_prev = (avg_vol_20d * prev_close / float_shares) if float_shares > 0 and prev_close > 0 and avg_vol_20d > 0 else 0
+
+    # SI — match training string tiers exactly
+    si_pct  = snap.get("si_pct", -1)
+    si_tier = "unknown"
+    if si_pct is not None and si_pct >= 0:
+        if si_pct < 5:    si_tier = "low"
+        elif si_pct < 15: si_tier = "medium"
+        elif si_pct < 30: si_tier = "high"
+        else:             si_tier = "extreme"
+
+    # EDGAR — all fields from training
+    has_8k_val          = has_8k
+    has_8k_yesterday    = ef.get("has_8k_yesterday", 0)
+    has_8k_2days_ago    = ef.get("has_8k_2days_ago", 0)
+    days_since_last_8k  = ef.get("days_since_last_8k", 999)
+    has_merger          = ef.get("has_merger", 0)
+    has_fda             = ef.get("has_fda", 0)
+    has_contract        = ef.get("has_contract", 0)
+    has_dilution        = ef.get("has_dilution", 0)
+    has_earnings        = ef.get("has_earnings", 0)
+    has_reverse_split   = ef.get("has_reverse_split", 0)
+    has_buyback         = ef.get("has_buyback", 0)
+    dilution_count_6m   = ef.get("dilution_count_6m", 0)
+    dilution_count_30d  = ef.get("dilution_count_30d", 0)
+    days_since_dilution = ef.get("days_since_dilution", 999)
+    reverse_split_count = ef.get("reverse_split_count", 0)
+    is_serial_diluter   = ef.get("is_serial_diluter", 0)
+    is_serial_reverser  = ef.get("is_serial_reverser", 0)
+    has_form4_buy       = ef.get("has_form4_buy", 0)
+    form4_buy_count     = ef.get("form4_buy_count", 0)
+    has_sc13d           = ef.get("has_sc13d", 0)
+    edgar_fetch_ok      = ef.get("edgar_fetch_ok", 0)
+    edgar_dilution_ok   = ef.get("edgar_dilution_ok", 0)
+    form4_fetch_ok      = ef.get("form4_fetch_ok", 0)
+    sc13d_fetch_ok      = ef.get("sc13d_fetch_ok", 0)
+    filing_hour         = ef.get("8k_filing_hour", 0)
+    hours_before_open   = ef.get("hours_before_open", 0)
+
+    # Earnings
+    days_to_earnings       = snap.get("days_to_earnings", 999) or 999
+    has_earnings_soon      = snap.get("has_earnings_soon", 0)
+    had_earnings_recently  = snap.get("had_earnings_recently", 0)
+    earnings_fetch_ok      = snap.get("earnings_fetch_ok", 0)
+
+    # Halt features
+    halted_yesterday  = snap.get("halted_yesterday", 0)
+    halt_count_5d     = snap.get("halt_count_5d", 0)
+    halt_count_30d    = snap.get("halt_count_30d", 0)
+    is_serial_halter  = snap.get("is_serial_halter", 0)
+    halt_fetch_ok     = snap.get("halt_fetch_ok", 0)
+    days_since_halt   = snap.get("days_since_last_halt", 999) or 999
+
+    # Sector
+    spy_pct    = snap.get("spy_prev_day_pct", 0) or 0
+    qqq_pct    = snap.get("qqq_prev_day_pct", 0) or 0
+    iwm_pct    = snap.get("iwm_prev_day_pct", 0) or 0
+    xbi_pct    = snap.get("xbi_prev_day_pct", 0) or 0
+    market_green = 1 if spy_pct > 0.003 else 0
+    market_red   = 1 if spy_pct < -0.003 else 0
+    sector_hot   = 1 if xbi_pct > 0.01 else 0
+    sector_fetch_ok = snap.get("sector_fetch_ok", 1)
+
     features = {col: 0 for col in _feature_cols}
     overrides = {
-        "prev_close":             prev_close,
-        "pm_open":                pm_open,
-        "pm_high":                pm_high,
-        "pm_low":                 pm_low,
-        "pm_close":               pm_close,
-        "pm_volume":              volume,
-        "pm_gap_pct":             gap_pct,
-        "pm_move_pct":            pm_move_pct,
-        "pm_remaining_to_seed":   rem_seed,
-        "pm_remaining_to_super":  rem_super,
-        "pm_remaining_to_mega":   rem_mega,
-        "pm_high_of_session":     1 if pm_close >= pm_high * 0.99 else 0,
-        "pm_fade":                1 if (pm_high > pm_open and
-                                  (pm_high - pm_close) > (pm_high - pm_open) * 0.10) else 0,
-        "pm_vol_ratio":           vol_ratio,
-        "float_shares":           details.get("float_shares", -1),
-        "float_M":                details.get("float_M", -1),
-        "float_tier":             details.get("float_tier", -1),
-        "market_cap":             details.get("market_cap", -1),
-        "is_foreign_listed":      details.get("is_foreign_listed", 0),
-        "has_8k":                 has_8k,
-        "days_since_last_8k":     ef.get("days_since_last_8k", 999),
-        "has_8k_yesterday":       ef.get("has_8k_yesterday", 0),
-        "has_merger":             ef.get("has_merger", 0),
-        "has_fda":                ef.get("has_fda", 0),
-        "has_contract":           ef.get("has_contract", 0),
-        "has_dilution":           ef.get("has_dilution", 0),
-        "days_since_dilution":    ef.get("days_since_dilution", 999),
-        "si_pct":                 snap.get("si_pct", -1),
-        "si_tier":                snap.get("si_tier", -1),
-        "days_to_cover":          -1,
-        "days_since_last_seed":   snap.get("days_since_last_seed", 999),
-        "prev_volume":            prev_vol,
-        "vol_ratio_prev":         vol_ratio,
-        "avg_volume_20d":         snap.get("avg_volume_20d", 0),
-        "prev_close":             prev_close,
-        "pct_from_52w_high":      snap.get("pct_from_52w_high", 0),
-        "pct_from_52w_low":       snap.get("pct_from_52w_low", 0),
-        "near_52w_low":           snap.get("near_52w_low", 0),
-        "coil_days":              snap.get("coil_days", 0),
-        "prev_3d_trend":          snap.get("prev_3d_trend", 0),
-        "prev_5d_trend":          snap.get("prev_5d_trend", 0),
-        "ah_move_pct":            snap.get("ah_move_pct", 0),
-        "ah_direction":           snap.get("ah_direction", 0),
-        "ah_volume":              snap.get("ah_volume", 0),
+        # T-1 price structure
+        "prev_close":           prev_close,
+        "prev_open":            prev_open,
+        "prev_high":            prev_high,
+        "prev_low":             prev_low,
+        "prev_volume":          prev_vol,
+        "prev_dollar_vol":      prev_dollar_vol,
+        "prev_body_pct":        prev_body_pct,
+        "prev_wick_ratio":      prev_wick_ratio,
+        # PM features
+        "pm_open":              pm_open,
+        "pm_high":              pm_high,
+        "pm_low":               pm_low,
+        "pm_close":             pm_close,
+        "pm_volume":            volume,
+        "pm_gap_pct":           gap_pct,
+        "pm_move_pct":          pm_move_pct,
+        "pm_vol_ratio":         pm_vol_ratio,
+        "pm_volume_build":      pm_volume_build,
+        "pm_remaining_to_seed":  rem_seed,
+        "pm_remaining_to_super": rem_super,
+        "pm_remaining_to_mega":  rem_mega,
+        "pm_high_of_session":   1 if pm_close >= pm_high * 0.99 and pm_high > 0 else 0,
+        "pm_fade":              1 if (pm_high > pm_open and pm_high > 0 and
+                                (pm_high - pm_close) > (pm_high - pm_open) * 0.10) else 0,
+        "pm_fetch_ok":          1 if pm_open > 0 else 0,
+        # AH features
+        "ah_move_pct":          snap.get("ah_move_pct", 0) or 0,
+        "ah_direction":         snap.get("ah_direction", 0) or 0,
+        "ah_volume":            snap.get("ah_volume", 0) or 0,
+        "ah_fetch_ok":          snap.get("ah_fetch_ok", 0) or 0,
+        # Historical
+        "price_52w_high":       snap.get("price_52w_high", 0) or 0,
+        "price_52w_low":        snap.get("price_52w_low", 0) or 0,
+        "pct_from_52w_high":    snap.get("pct_from_52w_high", 0) or 0,
+        "pct_from_52w_low":     snap.get("pct_from_52w_low", 0) or 0,
+        "near_52w_low":         snap.get("near_52w_low", 0),
+        "avg_volume_20d":       avg_vol_20d,
+        "vol_ratio_prev":       vol_ratio_prev,
+        "prev_3d_trend":        snap.get("prev_3d_trend", 0) or 0,
+        "prev_5d_trend":        snap.get("prev_5d_trend", 0) or 0,
+        "prev_10d_trend":       snap.get("prev_10d_trend", 0) or 0,
+        "days_since_last_spike": snap.get("days_since_last_spike", 999) or 999,
+        "coil_days":            snap.get("coil_days", 0),
+        "vol_trend_3d":         snap.get("vol_trend_3d", 0) or 0,
+        "consecutive_vol_days": snap.get("consecutive_vol_days", 0),
+        "hist_fetch_ok":        1 if snap.get("avg_volume_20d", 0) > 0 else 0,
+        # Float
+        "float_shares":         float_shares,
+        "float_M":              details.get("float_M", -1),
+        "float_tier":           details.get("float_tier", "unknown"),
+        "market_cap":           details.get("market_cap", -1),
+        "is_foreign_listed":    details.get("is_foreign_listed", 0),
+        "float_rotation_prev":  float_rotation_prev,
+        "float_fetch_ok":       1 if float_shares > 0 else 0,
+        # SI
+        "si_pct":               si_pct if si_pct is not None else -1,
+        "si_tier":              si_tier,
+        "si_fetch_ok":          1 if (si_pct is not None and si_pct >= 0) else 0,
+        # Days since events
+        "days_since_last_seed":     snap.get("days_since_last_seed", 999) or 999,
+        "days_since_last_8k":       days_since_last_8k,
+        "days_since_last_halt":     days_since_halt,
+        "days_since_last_dilution": days_since_dilution,
+        # EDGAR
+        "has_8k":               has_8k_val,
+        "has_8k_yesterday":     has_8k_yesterday,
+        "has_8k_2days_ago":     has_8k_2days_ago,
+        "8k_filing_hour":       filing_hour,
+        "hours_before_open":    hours_before_open,
+        "has_merger":           has_merger,
+        "has_fda":              has_fda,
+        "has_contract":         has_contract,
+        "has_dilution":         has_dilution,
+        "has_earnings":         has_earnings,
+        "has_reverse_split":    has_reverse_split,
+        "has_buyback":          has_buyback,
+        "dilution_count_6m":    dilution_count_6m,
+        "dilution_count_30d":   dilution_count_30d,
+        "reverse_split_count":  reverse_split_count,
+        "is_serial_diluter":    is_serial_diluter,
+        "is_serial_reverser":   is_serial_reverser,
+        "has_form4_buy":        has_form4_buy,
+        "form4_buy_count":      form4_buy_count,
+        "has_sc13d":            has_sc13d,
+        "edgar_fetch_ok":       edgar_fetch_ok,
+        "edgar_dilution_ok":    edgar_dilution_ok,
+        "form4_fetch_ok":       form4_fetch_ok,
+        "sc13d_fetch_ok":       sc13d_fetch_ok,
+        # Halts
+        "halted_yesterday":     halted_yesterday,
+        "halt_count_5d":        halt_count_5d,
+        "halt_count_30d":       halt_count_30d,
+        "is_serial_halter":     is_serial_halter,
+        "halt_fetch_ok":        halt_fetch_ok,
+        # Earnings
+        "days_to_earnings":     days_to_earnings,
+        "has_earnings_soon":    has_earnings_soon,
+        "had_earnings_recently": had_earnings_recently,
+        "earnings_fetch_ok":    earnings_fetch_ok,
+        # Sector
+        "spy_prev_day_pct":     spy_pct,
+        "qqq_prev_day_pct":     qqq_pct,
+        "iwm_prev_day_pct":     iwm_pct,
+        "xbi_prev_day_pct":     xbi_pct,
+        "market_green":         market_green,
+        "market_red":           market_red,
+        "sector_hot":           sector_hot,
+        "sector_fetch_ok":      sector_fetch_ok,
     }
     for k, v in overrides.items():
         if k in features:
@@ -425,15 +575,35 @@ def score_universe():
         return
     si_map   = get_si_data()
     edgar_8k = get_edgar_8k_today()
+
+    # Sector: pull 2 days so we get T-1 change exactly like training
     sector_data = {}
+    two_days_ago = last_day - timedelta(days=5)  # go back far enough to find 2 trading days
     for sym in ["SPY", "QQQ", "IWM", "XBI"]:
-        sd = poly_get(f"/v2/aggs/ticker/{sym}/range/1/day/{last_day}/{last_day}")
-        if sd and sd.get("results"):
-            r = sd["results"][0]
+        sd = poly_get(
+            f"/v2/aggs/ticker/{sym}/range/1/day/{two_days_ago}/{last_day}",
+            {"adjusted": "false", "limit": 5}
+        )
+        if sd and sd.get("results") and len(sd["results"]) >= 2:
+            r0 = sd["results"][-2]  # T-2
+            r1 = sd["results"][-1]  # T-1
+            if r0.get("c", 0) > 0:
+                sector_data[sym] = (r1.get("c", 0) - r0.get("c", 0)) / r0.get("c", 1)
+            else:
+                sector_data[sym] = 0
+        elif sd and sd.get("results"):
+            r = sd["results"][-1]
             sector_data[sym] = (r.get("c", 0) - r.get("o", 0)) / r.get("o", 1)
+
+    spy_pct = sector_data.get("SPY", 0)
+    qqq_pct = sector_data.get("QQQ", 0)
+    iwm_pct = sector_data.get("IWM", 0)
+    xbi_pct = sector_data.get("XBI", 0)
+
     candidates = []
     total = len(data["results"])
     log.info(f"Scoring {total} tickers...")
+
     for bar in data["results"]:
         ticker     = bar.get("T", "")
         close      = bar.get("c", 0) or 0
@@ -442,6 +612,7 @@ def score_universe():
         low        = bar.get("l", 0) or 0
         open_      = bar.get("o", 0) or 0
         dollar_vol = close * volume
+
         if not ticker or len(ticker) > 5:
             continue
         if ticker.endswith("W") or ticker.endswith("R") or "." in ticker:
@@ -452,85 +623,219 @@ def score_universe():
             continue
         if volume < 5_000:
             continue
+
         details = get_ticker_details(ticker)
         if details.get("float_M", -1) > 100:
             continue
+
+        # ── Historical features ───────────────────────────────
         hist = poly_get(
             f"/v2/aggs/ticker/{ticker}/range/1/day/"
             f"{(last_day - timedelta(days=365)).isoformat()}/{last_day.isoformat()}",
             {"adjusted": "false", "limit": 365}
         )
         hist_results = hist.get("results", []) if hist else []
+
         price_52w_high = max([r.get("h", 0) for r in hist_results], default=close)
         price_52w_low  = min([r.get("l", 0) for r in hist_results], default=close)
         pct_52w_high   = (close - price_52w_high) / price_52w_high if price_52w_high > 0 else 0
         pct_52w_low    = (close - price_52w_low)  / price_52w_low  if price_52w_low  > 0 else 0
         near_52w_low   = 1 if close < price_52w_low * 1.10 else 0
-        recent_vols    = [r.get("v", 0) for r in hist_results[-20:]] if hist_results else []
-        avg_vol_20d    = np.mean(recent_vols) if recent_vols else 0
-        vol_ratio      = volume / avg_vol_20d if avg_vol_20d > 0 else 0
-        closes         = [r.get("c", 0) for r in hist_results]
-        trend_3d = (closes[-1]-closes[-4])/closes[-4] if len(closes)>=4 and closes[-4]>0 else 0
-        trend_5d = (closes[-1]-closes[-6])/closes[-6] if len(closes)>=6 and closes[-6]>0 else 0
+
+        recent_vols = [r.get("v", 0) for r in hist_results[-20:]] if hist_results else []
+        avg_vol_20d = float(np.mean(recent_vols)) if recent_vols else 0
+        vol_ratio_prev = volume / avg_vol_20d if avg_vol_20d > 0 else 0
+
+        closes = [r.get("c", 0) for r in hist_results]
+        volumes_hist = [r.get("v", 0) for r in hist_results]
+
+        trend_3d  = (closes[-1]-closes[-4])/closes[-4]  if len(closes)>=4  and closes[-4]>0  else 0
+        trend_5d  = (closes[-1]-closes[-6])/closes[-6]  if len(closes)>=6  and closes[-6]>0  else 0
+        trend_10d = (closes[-1]-closes[-11])/closes[-11] if len(closes)>=11 and closes[-11]>0 else 0
+
+        # Vol trend 3d
+        vol_trend_3d = 0
+        if len(volumes_hist) >= 3:
+            v3 = volumes_hist[-3:]
+            if v3[0] > 0:
+                vol_trend_3d = (v3[-1] - v3[0]) / v3[0]
+
+        # Consecutive above-avg vol days
+        consec_vol = 0
+        for v in reversed(volumes_hist):
+            if avg_vol_20d > 0 and v > avg_vol_20d:
+                consec_vol += 1
+            else:
+                break
+
+        # Days since last volume spike (3x avg)
+        spike_days = 0
+        for r in reversed(hist_results):
+            if avg_vol_20d > 0 and r.get("v", 0) > avg_vol_20d * 3:
+                break
+            spike_days += 1
+
+        # Coil days — consecutive below-avg volume compression
         coil = 0
         if len(hist_results) >= 5:
-            ranges = [r.get("h", 0) - r.get("l", 0) for r in hist_results[-10:]]
-            for i in range(len(ranges)-1, 0, -1):
-                if ranges[i] <= ranges[i-1]:
+            for r in reversed(hist_results):
+                if avg_vol_20d > 0 and r.get("v", 0) < avg_vol_20d * 0.8:
                     coil += 1
                 else:
                     break
+
+        # T-1 price structure (bar = last_day bar)
+        prev_body_pct  = abs(close - open_) / open_ if open_ > 0 else 0
+        total_range    = high - low
+        body           = abs(close - open_)
+        prev_wick_ratio = 1 - (body / total_range) if total_range > 0 else 0
+        prev_dollar_vol = close * volume
+
+        # ── AH features from Polygon snapshot ────────────────
+        ah_move_pct  = 0
+        ah_direction = 0
+        ah_volume    = 0
+        ah_fetch_ok  = 0
+        snap_data = poly_get(
+            "/v2/snapshot/locale/us/markets/stocks/tickers",
+            {"tickers": ticker, "include_otc": "false"}
+        )
+        if snap_data and snap_data.get("tickers"):
+            t_snap = snap_data["tickers"][0]
+            ah = t_snap.get("afterHours", {})
+            if ah and ah.get("c") and ah.get("o"):
+                ah_o = float(ah.get("o", 0))
+                ah_c = float(ah.get("c", 0))
+                ah_v = float(ah.get("v", 0))
+                if ah_o > 0:
+                    ah_move_pct  = (ah_c - ah_o) / ah_o
+                    ah_direction = 1 if ah_c > ah_o else (-1 if ah_c < ah_o else 0)
+                    ah_volume    = ah_v
+                    ah_fetch_ok  = 1
+
+        # ── SI features ───────────────────────────────────────
         si_pct  = si_map.get(ticker, -1)
-        si_tier = -1
+        si_tier = "unknown"
         if si_pct >= 0:
-            if si_pct < 5:    si_tier = 0
-            elif si_pct < 15: si_tier = 1
-            elif si_pct < 30: si_tier = 2
-            else:             si_tier = 3
-        ef = {"days_since_last_8k": 999, "has_8k_yesterday": 0,
-              "has_merger": 0, "has_fda": 0, "has_contract": 0,
-              "has_dilution": 0, "days_since_dilution": 999}
+            if si_pct < 5:    si_tier = "low"
+            elif si_pct < 15: si_tier = "medium"
+            elif si_pct < 30: si_tier = "high"
+            else:             si_tier = "extreme"
+
+        # ── EDGAR features ────────────────────────────────────
+        ef = {
+            "days_since_last_8k":   999,
+            "has_8k_yesterday":     0,
+            "has_8k_2days_ago":     0,
+            "8k_filing_hour":       0,
+            "hours_before_open":    0,
+            "has_merger":           0,
+            "has_fda":              0,
+            "has_contract":         0,
+            "has_dilution":         0,
+            "has_earnings":         0,
+            "has_reverse_split":    0,
+            "has_buyback":          0,
+            "dilution_count_6m":    0,
+            "dilution_count_30d":   0,
+            "days_since_dilution":  999,
+            "reverse_split_count":  0,
+            "is_serial_diluter":    0,
+            "is_serial_reverser":   0,
+            "has_form4_buy":        0,
+            "form4_buy_count":      0,
+            "has_sc13d":            0,
+            "edgar_fetch_ok":       0,
+            "edgar_dilution_ok":    0,
+            "form4_fetch_ok":       0,
+            "sc13d_fetch_ok":       0,
+        }
         if ticker in edgar_8k:
             filings = edgar_8k[ticker]
             latest  = max(filings, key=lambda x: x.get("filed", ""))
             try:
-                filed_date = date.fromisoformat(latest["filed"][:10])
-                ef["days_since_last_8k"] = (last_day - filed_date).days
-                ef["has_8k_yesterday"]   = 1 if ef["days_since_last_8k"] <= 1 else 0
+                filed_str  = latest["filed"]
+                filed_date = date.fromisoformat(filed_str[:10])
+                days_since = (last_day - filed_date).days
+                ef["days_since_last_8k"]  = days_since
+                ef["has_8k_yesterday"]    = 1 if days_since <= 1 else 0
+                ef["has_8k_2days_ago"]    = 1 if days_since == 2 else 0
+                ef["edgar_fetch_ok"]      = 1
+                # Filing hour — parse if time is in the filed string
+                if "T" in filed_str:
+                    try:
+                        filed_dt = datetime.fromisoformat(filed_str)
+                        ef["8k_filing_hour"]    = filed_dt.hour
+                        # Hours before 9:30 AM open
+                        open_hour = 9.5
+                        filing_hour_et = filed_dt.hour + filed_dt.minute / 60
+                        ef["hours_before_open"] = max(0, open_hour - filing_hour_et)
+                    except Exception:
+                        pass
+                # Parse filing text for keywords
+                text = str(latest).lower()
+                ef["has_merger"]        = 1 if any(w in text for w in ["merger", "acqui", "takeover"]) else 0
+                ef["has_fda"]           = 1 if "fda" in text else 0
+                ef["has_contract"]      = 1 if "contract" in text else 0
+                ef["has_dilution"]      = 1 if any(w in text for w in ["dilut", "offering", "424b"]) else 0
+                ef["has_reverse_split"] = 1 if "reverse split" in text else 0
+                ef["has_buyback"]       = 1 if "buyback" in text or "repurchas" in text else 0
             except Exception:
                 pass
-        snap = {
-            "prev_close":        close,
-            "pm_open":           open_,
-            "pm_high":           high,
-            "pm_low":            low,
-            "pm_close":          close,
-            "volume":            volume,
-            "prev_vol":          volume,
-            "gap_pct":           0,
-            "si_pct":            si_pct,
-            "si_tier":           si_tier,
-            "pct_from_52w_high": pct_52w_high,
-            "pct_from_52w_low":  pct_52w_low,
-            "near_52w_low":      near_52w_low,
-            "coil_days":         coil,
-            "prev_3d_trend":     trend_3d,
-            "prev_5d_trend":     trend_5d,
-            "avg_volume_20d":    avg_vol_20d,
-            "ah_move_pct":       0,
-            "ah_direction":      0,
-            "ah_volume":         0,
-            "spy_prev_day_pct":  sector_data.get("SPY", 0),
-            "qqq_prev_day_pct":  sector_data.get("QQQ", 0),
-            "iwm_prev_day_pct":  sector_data.get("IWM", 0),
-            "xbi_prev_day_pct":  sector_data.get("XBI", 0),
-            "market_green":      1 if sector_data.get("SPY", 0) > 0 else 0,
-            "market_red":        1 if sector_data.get("SPY", 0) < 0 else 0,
-            "sector_hot":        1 if sector_data.get("XBI", 0) > 0.01 else 0,
-        }
+
         has_8k = 1 if ef["days_since_last_8k"] <= 3 else 0
-        fvec   = build_features(snap, details, has_8k=has_8k, edgar_features=ef)
+
+        snap = {
+            # T-1 price
+            "prev_close":           close,
+            "prev_open":            open_,
+            "prev_high":            high,
+            "prev_low":             low,
+            "prev_volume":          volume,
+            "prev_dollar_vol":      prev_dollar_vol,
+            "prev_body_pct":        prev_body_pct,
+            "prev_wick_ratio":      prev_wick_ratio,
+            # PM — zeroed at midnight, filled at 4AM rescore
+            "pm_open":              0,
+            "pm_high":              0,
+            "pm_low":               0,
+            "pm_close":             close,
+            "pm_volume":            0,
+            "pm_gap_pct":           0,
+            # AH from snapshot
+            "ah_move_pct":          ah_move_pct,
+            "ah_direction":         ah_direction,
+            "ah_volume":            ah_volume,
+            "ah_fetch_ok":          ah_fetch_ok,
+            # SI
+            "si_pct":               si_pct,
+            "si_tier":              si_tier,
+            # Historical
+            "price_52w_high":       price_52w_high,
+            "price_52w_low":        price_52w_low,
+            "pct_from_52w_high":    pct_52w_high,
+            "pct_from_52w_low":     pct_52w_low,
+            "near_52w_low":         near_52w_low,
+            "avg_volume_20d":       avg_vol_20d,
+            "vol_ratio_prev":       vol_ratio_prev,
+            "prev_3d_trend":        trend_3d,
+            "prev_5d_trend":        trend_5d,
+            "prev_10d_trend":       trend_10d,
+            "vol_trend_3d":         vol_trend_3d,
+            "consecutive_vol_days": consec_vol,
+            "days_since_last_spike": spike_days,
+            "coil_days":            coil,
+            # Sector
+            "spy_prev_day_pct":     spy_pct,
+            "qqq_prev_day_pct":     qqq_pct,
+            "iwm_prev_day_pct":     iwm_pct,
+            "xbi_prev_day_pct":     xbi_pct,
+            "sector_fetch_ok":      1 if sector_data else 0,
+        }
+
+        fvec = build_features(snap, details, has_8k=has_8k, edgar_features=ef)
         scores, _ = score_ticker(fvec)
+
         candidates.append({
             "ticker":        ticker,
             "prev_close":    close,
@@ -548,8 +853,10 @@ def score_universe():
             "snap_base":     snap,
             "details":       details,
         })
+
     candidates.sort(key=lambda x: x["seed_score"], reverse=True)
     _watchlist = candidates[:MAX_WATCHLIST]
+
     wl_file = DATA_DIR / f"{date.today().isoformat()}_watchlist.json"
     with open(wl_file, "w") as f:
         json.dump([{
@@ -563,6 +870,7 @@ def score_universe():
             "has_8k":       w["has_8k"],
             "near_52w_low": w["near_52w_low"],
         } for w in _watchlist], f, indent=2)
+
     log.info(f"Overnight score complete. Top {len(_watchlist)} watchlist:")
     for w in _watchlist[:5]:
         log.info(f"  {w['ticker']}: seed={w['seed_score']:.3f} "

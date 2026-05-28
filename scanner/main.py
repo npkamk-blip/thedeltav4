@@ -600,29 +600,57 @@ def score_universe():
     iwm_pct = sector_data.get("IWM", 0)
     xbi_pct = sector_data.get("XBI", 0)
 
+    # ── Pre-filter universe ───────────────────────────────────
+    universe = []
+    for bar in data["results"]:
+        t  = bar.get("T", "")
+        c  = bar.get("c", 0) or 0
+        v  = bar.get("v", 0) or 0
+        dv = c * v
+        if not t or len(t) > 5: continue
+        if t.endswith("W") or t.endswith("R") or "." in t: continue
+        if c < MIN_PRICE or c > MAX_PRICE: continue
+        if dv < MIN_DOLLAR_VOL: continue
+        if v < 5_000: continue
+        universe.append(bar)
+    log.info(f"Universe after price/vol filter: {len(universe)} tickers")
+
+    # ── Batch fetch AH snapshots BEFORE the main loop ────────
+    ah_map = {}
+    universe_tickers = [b.get("T", "") for b in universe]
+    for i in range(0, len(universe_tickers), 100):
+        chunk = universe_tickers[i:i+100]
+        sd = poly_get(
+            "/v2/snapshot/locale/us/markets/stocks/tickers",
+            {"tickers": ",".join(chunk), "include_otc": "false"}
+        )
+        if sd and sd.get("tickers"):
+            for t_snap in sd["tickers"]:
+                sym = t_snap.get("ticker", "")
+                ah  = t_snap.get("afterHours", {})
+                if ah and ah.get("c") and ah.get("o"):
+                    ah_o = float(ah.get("o", 0))
+                    ah_c = float(ah.get("c", 0))
+                    if ah_o > 0:
+                        ah_map[sym] = {
+                            "ah_move_pct":  (ah_c - ah_o) / ah_o,
+                            "ah_direction": 1 if ah_c > ah_o else (-1 if ah_c < ah_o else 0),
+                            "ah_volume":    float(ah.get("v", 0)),
+                            "ah_fetch_ok":  1,
+                        }
+    log.info(f"AH data: {len(ah_map)} tickers with after-hours activity")
+
     candidates = []
-    total = len(data["results"])
+    total = len(universe)
     log.info(f"Scoring {total} tickers...")
 
-    for bar in data["results"]:
-        ticker     = bar.get("T", "")
-        close      = bar.get("c", 0) or 0
-        volume     = bar.get("v", 0) or 0
-        high       = bar.get("h", 0) or 0
-        low        = bar.get("l", 0) or 0
-        open_      = bar.get("o", 0) or 0
-        dollar_vol = close * volume
-
-        if not ticker or len(ticker) > 5:
-            continue
-        if ticker.endswith("W") or ticker.endswith("R") or "." in ticker:
-            continue
-        if close < MIN_PRICE or close > MAX_PRICE:
-            continue
-        if dollar_vol < MIN_DOLLAR_VOL:
-            continue
-        if volume < 5_000:
-            continue
+    for bar in universe:
+        ticker = bar.get("T", "")
+        close  = bar.get("c", 0) or 0
+        volume = bar.get("v", 0) or 0
+        high   = bar.get("h", 0) or 0
+        low    = bar.get("l", 0) or 0
+        open_  = bar.get("o", 0) or 0
 
         details = get_ticker_details(ticker)
         if details.get("float_M", -1) > 100:
@@ -691,27 +719,12 @@ def score_universe():
         prev_wick_ratio = 1 - (body / total_range) if total_range > 0 else 0
         prev_dollar_vol = close * volume
 
-        # ── AH features from Polygon snapshot ────────────────
-        ah_move_pct  = 0
-        ah_direction = 0
-        ah_volume    = 0
-        ah_fetch_ok  = 0
-        snap_data = poly_get(
-            "/v2/snapshot/locale/us/markets/stocks/tickers",
-            {"tickers": ticker, "include_otc": "false"}
-        )
-        if snap_data and snap_data.get("tickers"):
-            t_snap = snap_data["tickers"][0]
-            ah = t_snap.get("afterHours", {})
-            if ah and ah.get("c") and ah.get("o"):
-                ah_o = float(ah.get("o", 0))
-                ah_c = float(ah.get("c", 0))
-                ah_v = float(ah.get("v", 0))
-                if ah_o > 0:
-                    ah_move_pct  = (ah_c - ah_o) / ah_o
-                    ah_direction = 1 if ah_c > ah_o else (-1 if ah_c < ah_o else 0)
-                    ah_volume    = ah_v
-                    ah_fetch_ok  = 1
+        # ── AH features — from pre-fetched batch map ─────────
+        ah_data      = ah_map.get(ticker, {})
+        ah_move_pct  = ah_data.get("ah_move_pct",  0)
+        ah_direction = ah_data.get("ah_direction", 0)
+        ah_volume    = ah_data.get("ah_volume",    0)
+        ah_fetch_ok  = ah_data.get("ah_fetch_ok",  0)
 
         # ── SI features ───────────────────────────────────────
         si_pct  = si_map.get(ticker, -1)

@@ -28,7 +28,7 @@ for d in [LOG_DIR, ALERT_DIR, DATA_DIR]:
 MIN_PRICE       = 0.10
 MAX_PRICE       = 3.00
 MIN_DOLLAR_VOL  = 25_000
-MAX_WATCHLIST   = 20
+MAX_WATCHLIST   = 100
 MIN_GAP         = 0.05
 MAX_GAP         = 1.00
 MIN_VOLUME      = 10_000
@@ -593,7 +593,16 @@ def get_watchlist_snapshots(use_today_close=False):
         prev_close = wl.get("prev_close", 0) or prev.get("c", 0) or 0
         if prev_close <= 0:
             continue
-        pm_close = day.get("c", 0) or min_bar.get("c", 0) or 0
+        # Use lastTrade/lastQuote for pre-market price if day.c is stale
+        last_trade = t.get("lastTrade", {})
+        last_quote = t.get("lastQuote", {})
+        pm_close = (
+            day.get("c") or
+            min_bar.get("c") or
+            last_trade.get("p") or
+            last_quote.get("P") or
+            0
+        )
         change   = t.get("todaysChangePerc", 0) or 0
         if pm_close <= 0 and change != 0:
             pm_close = prev_close * (1 + change / 100)
@@ -683,11 +692,6 @@ def run_scan(mode="premarket", use_today_close=False):
         fired += 1
     return fired
 def run_basecamp():
-    """
-    EDGAR watch — 8PM to 4AM, every 10 minutes.
-    High score → Pushover alert only.
-    No watchlist writes — midnight scorer handles that.
-    """
     log.info("Basecamp: scanning EDGAR...")
     try:
         r = edgar_get(
@@ -704,7 +708,6 @@ def run_basecamp():
     import re as _re_bc
     for hit in hits:
         src = hit.get("_source", {})
-        # ── FIX 1: use display_names to extract ticker ────────
         ticker = ""
         display = src.get("display_names", [])
         for name in (display if isinstance(display, list) else [display]):
@@ -775,11 +778,6 @@ def run_basecamp():
         fired += 1
     log.info(f"Basecamp scan complete: {fired} alerts fired")
 def run_daily_validation():
-    """
-    4PM daily training data collector.
-    Path 1: watchlist outcomes → training data
-    Path 2: all seeds today (caught + missed) with full features → training data
-    """
     log.info("Running 4PM daily validation + training data collection...")
     today    = date.today()
     last_day = get_last_trading_day()
@@ -787,7 +785,6 @@ def run_daily_validation():
     training_records = []
     caught = []
     missed = []
-    # ── PATH 1: Watchlist Outcomes ────────────────────────────
     log.info("Path 1: pulling intraday highs for watchlist...")
     if _watchlist:
         ticker_str = ",".join(wl_tickers)
@@ -829,8 +826,6 @@ def run_daily_validation():
                 }
                 training_records.append(record)
                 log.info(f"Path1 {ticker}: high={intraday_high:.2f} pct={actual_pct:.0f}% seed={hit_seed}")
-    # ── PATH 2: All Seeds Today (caught + missed) ─────────────
-    # ── FIX 2: full 81 features for caught AND missed ─────────
     log.info("Path 2: pulling gainers for full feature training...")
     gainers = poly_get(
         "/v2/snapshot/locale/us/markets/stocks/gainers",
@@ -858,7 +853,6 @@ def run_daily_validation():
             else:
                 if ticker not in missed:
                     missed.append(ticker)
-            # Pull full features for ALL seeds
             details = get_ticker_details(ticker)
             float_M = details.get("float_M", -1)
             if float_M > 100:
@@ -925,18 +919,15 @@ def run_daily_validation():
             }
             training_records.append(record)
             log.info(f"Path2 {path.upper()}: {ticker} pct={actual_pct:.0f}% float={float_M:.1f}M 52wL={near_52w_low}")
-    # ── SAVE TRAINING DATA ────────────────────────────────────
     if training_records:
         outcomes_file = DATA_DIR / "training_outcomes.jsonl"
         with open(outcomes_file, "a") as f:
             for record in training_records:
                 f.write(json.dumps(record) + "\n")
         log.info(f"Saved {len(training_records)} training records to {outcomes_file}")
-    # ── RECALL ────────────────────────────────────────────────
     total_seeds = len(caught) + len(missed)
     recall      = len(caught) / total_seeds if total_seeds > 0 else 0
     log.info(f"Validation: {total_seeds} seeds | caught={len(caught)} | missed={len(missed)} | recall={recall:.0%}")
-    # ── PUSHOVER ──────────────────────────────────────────────
     lines = [f"📊 Daily Report — {today}"]
     lines.append(f"Seeds today: {total_seeds}")
     lines.append(f"Caught: {len(caught)} ({recall:.0%} recall)")
@@ -946,7 +937,6 @@ def run_daily_validation():
         lines.append(f"❌ Missed: {', '.join(missed[:5])}")
     lines.append(f"Training records: {len(training_records)}")
     send_pushover("📊 Delta v2 Daily Report", "\n".join(lines), "seed", priority=0)
-    # ── SAVE VALIDATION JSON ──────────────────────────────────
     val_file = ALERT_DIR / f"{today.isoformat()}_validation.json"
     with open(val_file, "w") as f:
         json.dump({
@@ -1093,6 +1083,71 @@ class Handler(BaseHTTPRequestHandler):
                 "near_52w_low": w["near_52w_low"],
             } for w in _watchlist]
             self.wfile.write(json.dumps(wl, indent=2).encode())
+            return
+        if parsed.path == "/features":
+            params = parse_qs(parsed.query)
+            ticker = params.get("ticker", [""])[0].upper().strip()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            if not ticker:
+                # No ticker — summary of all watchlist feature coverage
+                summary = []
+                for w in _watchlist:
+                    snap = w.get("snap_base", {})
+                    summary.append({
+                        "ticker":          w["ticker"],
+                        "seed_score":      w["seed_score"],
+                        "super_score":     w["super_score"],
+                        "gap_pct":         snap.get("gap_pct", 0),
+                        "volume":          snap.get("volume", 0),
+                        "avg_vol_20d":     snap.get("avg_volume_20d", 0),
+                        "ah_move_pct":     snap.get("ah_move_pct", 0),
+                        "ah_volume":       snap.get("ah_volume", 0),
+                        "si_pct":          snap.get("si_pct", -1),
+                        "near_52w_low":    snap.get("near_52w_low", 0),
+                        "coil_days":       snap.get("coil_days", 0),
+                        "prev_3d_trend":   snap.get("prev_3d_trend", 0),
+                        "prev_5d_trend":   snap.get("prev_5d_trend", 0),
+                        "has_8k":          w.get("has_8k", 0),
+                        "days_since_8k":   w.get("days_since_8k", 999),
+                        "float_M":         w.get("float_M", -1),
+                    })
+                self.wfile.write(json.dumps(summary, indent=2).encode())
+                return
+            # Specific ticker — full feature vector breakdown
+            wl = next((w for w in _watchlist if w["ticker"] == ticker), None)
+            if not wl:
+                self.wfile.write(json.dumps({
+                    "error": f"{ticker} not on watchlist",
+                    "watchlist_size": len(_watchlist),
+                    "watchlist_tickers": [w["ticker"] for w in _watchlist],
+                }).encode())
+                return
+            snap    = wl.get("snap_base", {})
+            details = wl.get("details", {})
+            ef      = wl.get("ef", {})
+            fvec    = build_features(snap, details,
+                                     has_8k=wl.get("has_8k", 0),
+                                     edgar_features=ef)
+            feature_dict = {
+                col: round(float(fvec[0][i]), 6)
+                for i, col in enumerate(_feature_cols)
+            }
+            zeros    = [k for k, v in feature_dict.items() if v == 0]
+            nonzeros = {k: v for k, v in feature_dict.items() if v != 0}
+            self.wfile.write(json.dumps({
+                "ticker":        ticker,
+                "seed_score":    wl["seed_score"],
+                "super_score":   wl["super_score"],
+                "mega_score":    wl["mega_score"],
+                "snap_inputs":   snap,
+                "filled":        nonzeros,
+                "zeroed_out":    zeros,
+                "zero_count":    len(zeros),
+                "filled_count":  len(nonzeros),
+                "total_features": len(_feature_cols),
+            }, indent=2).encode())
             return
         self.send_response(404)
         self.end_headers()

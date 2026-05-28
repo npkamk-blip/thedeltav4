@@ -326,28 +326,29 @@ def collect_ticker(ticker: str) -> bool:
         fetch_ok["pm_fetch_ok"] = True
         log.info(f"OK pm | {ticker} | {len(pm_bars)} minute bars")
 
-    pm_df = pd.DataFrame(pm_bars) if pm_bars else pd.DataFrame()
+    all_bars_df = pd.DataFrame(pm_bars) if pm_bars else pd.DataFrame()
+    pm_df = pd.DataFrame()
     ah_df = pd.DataFrame()
 
-    if not pm_df.empty:
-        pm_df["t"]      = pd.to_datetime(pm_df["t"], unit="ms", utc=True).dt.tz_convert(ET)
-        pm_df["hour"]   = pm_df["t"].dt.hour
-        pm_df["minute"] = pm_df["t"].dt.minute
-        pm_df["date"]   = pm_df["t"].dt.date
+    if not all_bars_df.empty:
+        all_bars_df["t"]      = pd.to_datetime(all_bars_df["t"], unit="ms", utc=True).dt.tz_convert(ET)
+        all_bars_df["hour"]   = all_bars_df["t"].dt.hour
+        all_bars_df["minute"] = all_bars_df["t"].dt.minute
+        all_bars_df["date"]   = all_bars_df["t"].dt.date
 
         # Premarket: 4AM-9:29AM
-        pm_df = pm_df[
-            (pm_df["hour"] >= 4) &
-            ((pm_df["hour"] < 9) | ((pm_df["hour"] == 9) & (pm_df["minute"] < 30)))
+        pm_df = all_bars_df[
+            (all_bars_df["hour"] >= 4) &
+            ((all_bars_df["hour"] < 9) | ((all_bars_df["hour"] == 9) & (all_bars_df["minute"] < 30)))
         ].copy()
 
-        # After-hours: 4PM-8PM
-        ah_df = pm_df[
-            (pm_df["hour"] >= 16) & (pm_df["hour"] < 20)
+        # After-hours: 4PM-8PM — separate slice from full bars
+        ah_df = all_bars_df[
+            (all_bars_df["hour"] >= 16) & (all_bars_df["hour"] < 20)
         ].copy()
 
         if ah_df.empty:
-            log.warning(f"WARN ah | {ticker} | no after-hours bars found")
+            log.warning(f"WARN ah | {ticker} | no after-hours bars found in minute data")
             STATS["ah_fail"] += 1
         else:
             fetch_ok["ah_fetch_ok"] = True

@@ -18,6 +18,13 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# Force unbuffered output
+os.environ["PYTHONUNBUFFERED"] = "1"
+import builtins
+_print = builtins.print
+builtins.print = lambda *a, **kw: _print(*a, **{**kw, "flush": True})
+
 from xgboost import XGBClassifier
 from sklearn.metrics import roc_auc_score, average_precision_score, precision_score, recall_score
 

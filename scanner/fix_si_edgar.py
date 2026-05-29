@@ -14,7 +14,19 @@ Run from shell:
 import pandas as pd
 import json
 import logging
+import threading
+import time
 from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class _Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers()
+        self.wfile.write(b"alive")
+    def log_message(self, *a): pass
+
+def start_keepalive(port=8080):
+    HTTPServer(("0.0.0.0", port), _Health).serve_forever()
 
 DATA_ROOT = Path("/app/data")
 RAW_DIR   = DATA_ROOT / "raw"
@@ -150,11 +162,6 @@ def clear_assembled():
     log.info(f"Midnight files to delete: {len(mid_files)}")
     log.info(f"Morning files to delete:  {len(mor_files)}")
 
-    confirm = input("Delete all assembled parquets and re-assemble? (yes/no): ")
-    if confirm.strip().lower() != "yes":
-        log.info("Skipped — no files deleted")
-        return
-
     for f in mid_files + mor_files:
         f.unlink()
 
@@ -166,6 +173,9 @@ def clear_assembled():
 # MAIN
 # ─────────────────────────────────────────────
 def main():
+    threading.Thread(target=start_keepalive, daemon=True).start()
+    time.sleep(2)
+
     log.info("=" * 60)
     log.info("THE DELTA v2 — SI + EDGAR Fix Script")
     log.info("=" * 60)
@@ -199,3 +209,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+    log.info("fix_si_edgar.py complete — exiting cleanly")
+    import sys
+    sys.exit(0)

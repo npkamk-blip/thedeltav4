@@ -151,25 +151,54 @@ def load_halts_master() -> pd.DataFrame | None:
     return None
 
 
-def load_edgar_master() -> tuple[pd.DataFrame | None, dict]:
+# EDGAR cache — built once, holds only CIK → rows mapping
+_edgar_by_cik: dict = {}
+_edgar_loaded: bool = False
+
+def load_edgar_master() -> tuple[bool, dict]:
+    """
+    Load EDGAR master but index by CIK immediately and drop the full DataFrame.
+    This cuts memory from ~300MB to ~50MB by storing only what we need.
+    """
+    global _edgar_by_cik, _edgar_loaded
     master_path = EDGAR_DIR / "filings_master.parquet"
     cik_path    = EDGAR_DIR / "cik_map.json"
-    master = None
     cik_map = {}
-    if master_path.exists():
-        try:
-            master = pd.read_parquet(master_path)
-            master["filed_date"] = pd.to_datetime(master["filed"], errors="coerce").dt.date
-            log.info(f"EDGAR master loaded: {len(master)} filings")
-        except Exception as e:
-            log.error(f"FAIL EDGAR master corrupted: {e} — EDGAR features will be 0")
-    else:
-        log.warning("EDGAR master not found — EDGAR features will be 0")
+
     if cik_path.exists():
         with open(cik_path) as f:
             cik_map = json.load(f)
         log.info(f"CIK map loaded: {len(cik_map)} tickers")
-    return master, cik_map
+
+    if master_path.exists():
+        try:
+            # Load only the columns we actually use
+            master = pd.read_parquet(
+                master_path,
+                columns=["cik", "form_type", "filed", "company"]
+            )
+            master["filed_date"] = pd.to_datetime(master["filed"], errors="coerce").dt.date
+            log.info(f"EDGAR master loaded: {len(master)} filings — building CIK index...")
+
+            # Group by CIK and store as dict — drop the big DataFrame
+            for cik, group in master.groupby("cik"):
+                _edgar_by_cik[cik] = group.reset_index(drop=True)
+
+            del master
+            gc.collect()
+            _edgar_loaded = True
+            log.info(f"EDGAR CIK index built: {len(_edgar_by_cik)} companies")
+        except Exception as e:
+            log.error(f"FAIL EDGAR master corrupted: {e} — EDGAR features will be 0")
+    else:
+        log.warning("EDGAR master not found — EDGAR features will be 0")
+
+    return _edgar_loaded, cik_map
+
+
+def get_edgar_for_cik(cik: str) -> pd.DataFrame | None:
+    """Get EDGAR filings for a specific CIK from the pre-built index."""
+    return _edgar_by_cik.get(cik)
 
 
 # ─────────────────────────────────────────────
@@ -457,7 +486,7 @@ def calc_si_features(ticker: str, trade_date: date, si_master: pd.DataFrame | No
 
 
 def calc_edgar_features(ticker: str, trade_date: date,
-                         cik_map: dict, edgar_master: pd.DataFrame | None) -> dict:
+                         cik_map: dict, edgar_master=None) -> dict:
     out = {
         "has_8k": 0, "has_8k_yesterday": 0, "has_8k_2days_ago": 0,
         "8k_filing_hour": 0, "hours_before_open": 0,
@@ -468,16 +497,14 @@ def calc_edgar_features(ticker: str, trade_date: date,
         "has_form4_buy": 0, "form4_buy_count": 0,
         "has_sc13d": 0, "edgar_fetch_ok": 0,
     }
-    if edgar_master is None or edgar_master.empty:
-        return out
-
     cik = cik_map.get(ticker)
     if not cik:
         return out
 
-    rows = edgar_master[edgar_master["cik"] == cik].copy()
-    if rows.empty:
+    rows = get_edgar_for_cik(cik)
+    if rows is None or rows.empty:
         return out
+    rows = rows.copy()
 
     out["edgar_fetch_ok"] = 1
     yesterday  = trade_date - timedelta(days=1)
@@ -804,7 +831,6 @@ def assemble_ticker_day(
     earnings_dates: list,
     si_master: pd.DataFrame | None,
     halts: pd.DataFrame | None,
-    edgar_master: pd.DataFrame | None,
     cik_map: dict,
     sector_data: dict,
     days_since_last_seed: int,
@@ -861,7 +887,7 @@ def assemble_ticker_day(
     si_feats = calc_si_features(ticker, trade_date, si_master)
 
     # EDGAR features
-    edgar_feats = calc_edgar_features(ticker, trade_date, cik_map, edgar_master)
+    edgar_feats = calc_edgar_features(ticker, trade_date, cik_map)
 
     # Halt features
     halt_feats = calc_halt_features(ticker, trade_date, halts)
@@ -916,7 +942,6 @@ def assemble_all(
     control_registry: dict,
     si_master: pd.DataFrame | None,
     halts: pd.DataFrame | None,
-    edgar_master: pd.DataFrame | None,
     cik_map: dict,
     sector_data: dict,
     trading_days: list[date],
@@ -1063,7 +1088,6 @@ def assemble_all(
                 earnings_dates=earnings_dates,
                 si_master=si_master,
                 halts=halts,
-                edgar_master=edgar_master,
                 cik_map=cik_map,
                 sector_data=sector_data,
                 days_since_last_seed=days_since,
@@ -1158,7 +1182,7 @@ def main():
     # Load support data
     si_master            = load_si_master()
     halts                = load_halts_master()
-    edgar_master, cik_map = load_edgar_master()
+    _, cik_map = load_edgar_master()
 
     # Load sector data
     log.info("Loading sector data...")
@@ -1175,7 +1199,6 @@ def main():
         control_registry=control_registry,
         si_master=si_master,
         halts=halts,
-        edgar_master=edgar_master,
         cik_map=cik_map,
         sector_data=sector_data,
         trading_days=trading_days,

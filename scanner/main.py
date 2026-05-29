@@ -23,9 +23,10 @@ POLYGON_API_KEY    = os.environ.get("MASSIVE_API_KEY", "")
 PUSHOVER_USER_KEY  = os.environ.get("PUSHOVER_USER_KEY", "utvy26j5q66kae27ncwxsftfcuhi92")
 PUSHOVER_APP_TOKEN = os.environ.get("PUSHOVER_APP_TOKEN", "a3szzncpvgyevbck6z5z5yszm7nzg3")
 
-MODEL_DIR  = Path(os.environ.get("MODEL_DIR",  "/app/data/models"))
-LOG_DIR    = Path(os.environ.get("LOG_DIR",    "/app/data/logs"))
-ALERT_DIR  = Path(os.environ.get("ALERT_DIR",  "/app/data/alerts"))
+MODEL_DIR        = Path(os.environ.get("MODEL_DIR",  "/data/models"))
+LOG_DIR          = Path(os.environ.get("LOG_DIR",    "/data/logs"))
+ALERT_DIR        = Path(os.environ.get("ALERT_DIR",  "/data/alerts"))
+DATA_SERVICE_URL = os.environ.get("DATA_SERVICE_URL", "https://thedeltav4-data-pull.onrender.com")
 
 for d in [LOG_DIR, ALERT_DIR]:
     d.mkdir(parents=True, exist_ok=True)
@@ -70,6 +71,40 @@ _feature_cols = {}
 _thresholds   = {}
 _watchlist    = {}
 _alerted      = set()
+
+
+def download_models():
+    """Download model files from data service if not already present."""
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    files = [
+        "midnight_seed_model.json",
+        "midnight_super_model.json",
+        "morning_seed_model.json",
+        "morning_super_model.json",
+        "feature_cols.json",
+        "thresholds.json",
+    ]
+    all_ok = True
+    for filename in files:
+        dest = MODEL_DIR / filename
+        if dest.exists():
+            log.info(f"Model already exists: {filename}")
+            continue
+        url = f"{DATA_SERVICE_URL}/models/{filename}"
+        log.info(f"Downloading: {url}")
+        try:
+            r = requests.get(url, timeout=120)
+            if r.status_code == 200:
+                with open(dest, "wb") as f:
+                    f.write(r.content)
+                log.info(f"Downloaded: {filename} ({len(r.content):,} bytes)")
+            else:
+                log.error(f"FAIL download {filename}: HTTP {r.status_code}")
+                all_ok = False
+        except Exception as e:
+            log.error(f"FAIL download {filename}: {e}")
+            all_ok = False
+    return all_ok
 
 
 def load_models():
@@ -706,9 +741,12 @@ def main():
     log.info("="*60)
     log.info("THE DELTA v2 — Scanner (two-model architecture)")
     log.info("="*60)
+    log.info("Downloading models from data service...")
+    if not download_models():
+        log.warning("Some models failed to download — will retry on next startup")
     load_models()
     if not _models:
-        log.error("No models loaded — check /app/data/models/")
+        log.error("No models loaded — check DATA_SERVICE_URL and model files")
     midnight_done = morning_done = False
     last_date = None
     while True:

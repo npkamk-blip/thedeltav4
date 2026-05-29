@@ -122,18 +122,42 @@ def get_next_trading_day(d: date) -> date | None:
 # ─────────────────────────────────────────────
 # LOAD SUPPORT DATA
 # ─────────────────────────────────────────────
-def load_si_master() -> pd.DataFrame | None:
+# SI cache — pre-indexed by Symbol for fast lookup
+_si_by_symbol: dict = {}
+_si_loaded: bool = False
+
+def load_si_master() -> bool:
+    """
+    Load SI master and index by Symbol immediately.
+    Columns: Date, Symbol, ShortVolume, ShortExemptVolume, TotalVolume, Market, si_date
+    Returns True if loaded successfully.
+    """
+    global _si_by_symbol, _si_loaded
     path = FINRA_DIR / "si_master.parquet"
-    if path.exists():
-        try:
-            df = pd.read_parquet(path)
-            log.info(f"SI master loaded: {len(df)} rows")
-            return df
-        except Exception as e:
-            log.error(f"FAIL SI master corrupted: {e} — SI features will be -1")
-            return None
-    log.warning("SI master not found — SI features will be -1")
-    return None
+    if not path.exists():
+        log.warning("SI master not found — SI features will be -1")
+        return False
+    try:
+        df = pd.read_parquet(path, columns=["Date","Symbol","ShortVolume","TotalVolume"])
+        df["_date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
+        df = df.dropna(subset=["_date","Symbol"])
+        log.info(f"SI master loaded: {len(df):,} rows — building Symbol index...")
+
+        for symbol, group in df.groupby("Symbol"):
+            _si_by_symbol[symbol] = group[["_date","ShortVolume","TotalVolume"]].reset_index(drop=True)
+
+        del df
+        gc.collect()
+        _si_loaded = True
+        log.info(f"SI Symbol index built: {len(_si_by_symbol)} symbols")
+        return True
+    except Exception as e:
+        log.error(f"FAIL SI master: {e} — SI features will be -1")
+        return False
+
+
+def get_si_for_symbol(symbol: str) -> pd.DataFrame | None:
+    return _si_by_symbol.get(symbol)
 
 
 def load_halts_master() -> pd.DataFrame | None:
@@ -173,9 +197,10 @@ def load_edgar_master() -> tuple[bool, dict]:
     if master_path.exists():
         try:
             # Load only the columns we actually use
+            # NOTE: no 'company' column in EDGAR index — only cik, form_type, filed, filename
             master = pd.read_parquet(
                 master_path,
-                columns=["cik", "form_type", "filed", "company"]
+                columns=["cik", "form_type", "filed", "filename"]
             )
             master["filed_date"] = pd.to_datetime(master["filed"], errors="coerce").dt.date
             log.info(f"EDGAR master loaded: {len(master)} filings — building CIK index...")
@@ -451,35 +476,38 @@ def calc_float_features(float_data: dict, prev_close: float, avg_vol_20d: float)
     return out
 
 
-def calc_si_features(ticker: str, trade_date: date, si_master: pd.DataFrame | None) -> dict:
+def calc_si_features(ticker: str, trade_date: date, si_master=None) -> dict:
+    """
+    SI master columns: Date, Symbol, ShortVolume, ShortExemptVolume, TotalVolume, Market, si_date
+    SI pct = ShortVolume / TotalVolume * 100
+    Uses pre-built _si_by_symbol index.
+    """
     out = {"si_pct": -1, "si_tier": -1, "si_fetch_ok": 0}
-    if si_master is None or si_master.empty:
+    if not _si_loaded:
         return out
 
-    t_col  = next((c for c in si_master.columns if "symbol" in c.lower() or "ticker" in c.lower()), None)
-    d_col  = next((c for c in si_master.columns if "date" in c.lower()), None)
-    si_col = next((c for c in si_master.columns if "short" in c.lower() and "vol" not in c.lower()), None)
-
-    if not all([t_col, d_col, si_col]):
+    rows = get_si_for_symbol(ticker)
+    if rows is None or rows.empty:
         return out
 
-    rows = si_master[si_master[t_col] == ticker].copy()
+    rows = rows[rows["_date"] <= trade_date]
     if rows.empty:
         return out
 
-    rows["_date"] = pd.to_datetime(rows[d_col], errors="coerce").dt.date
-    rows = rows.dropna(subset=["_date"])
-    rows["_diff"] = rows["_date"].apply(lambda d: abs((d - trade_date).days))
-    nearest = rows.nsmallest(1, "_diff").iloc[0]
+    # Get most recent SI reading before trade_date
+    nearest = rows.nlargest(1, "_date").iloc[0]
 
     try:
-        sp = float(nearest[si_col])
-        out["si_pct"]      = sp
-        out["si_fetch_ok"] = 1
-        if sp < 5:     out["si_tier"] = 0
-        elif sp < 15:  out["si_tier"] = 1
-        elif sp < 30:  out["si_tier"] = 2
-        else:          out["si_tier"] = 3
+        short_vol = float(nearest["ShortVolume"] or 0)
+        total_vol = float(nearest["TotalVolume"] or 0)
+        if total_vol > 0:
+            sp = (short_vol / total_vol) * 100
+            out["si_pct"]      = round(sp, 2)
+            out["si_fetch_ok"] = 1
+            if sp < 5:     out["si_tier"] = 0
+            elif sp < 15:  out["si_tier"] = 1
+            elif sp < 30:  out["si_tier"] = 2
+            else:          out["si_tier"] = 3
     except Exception:
         pass
     return out
@@ -527,12 +555,14 @@ def calc_edgar_features(ticker: str, trade_date: date,
             out["hours_before_open"] = max(0, 9.5 - (filed_dt.hour + filed_dt.minute / 60))
         except Exception:
             pass
-        text = " ".join(recent["company"].astype(str).tolist()).lower()
-        out["has_merger"]        = 1 if any(w in text for w in ["merger","acqui"]) else 0
-        out["has_fda"]           = 1 if "fda" in text else 0
-        out["has_contract"]      = 1 if "contract" in text else 0
-        out["has_reverse_split"] = 1 if "reverse" in text else 0
-        out["has_buyback"]       = 1 if "repurchas" in text else 0
+        # No company text in EDGAR index — use filename for basic hints
+        filenames = " ".join(recent["filename"].astype(str).tolist()).lower()
+        # These will mostly be 0 without full text — model learns from form_type instead
+        out["has_merger"]        = 0
+        out["has_fda"]           = 0
+        out["has_contract"]      = 0
+        out["has_reverse_split"] = 0
+        out["has_buyback"]       = 0
 
     # Dilution
     dil_forms = {"S-1","S-1/A","S-3","S-3/A","424B1","424B3","424B4","424B5"}
@@ -829,7 +859,6 @@ def assemble_ticker_day(
     pm_1min_df: pd.DataFrame,
     float_data: dict,
     earnings_dates: list,
-    si_master: pd.DataFrame | None,
     halts: pd.DataFrame | None,
     cik_map: dict,
     sector_data: dict,
@@ -884,7 +913,7 @@ def assemble_ticker_day(
     ah_feats = calc_ah_features(ah_df, trade_date, prev_close)
 
     # SI features
-    si_feats = calc_si_features(ticker, trade_date, si_master)
+    si_feats = calc_si_features(ticker, trade_date)
 
     # EDGAR features
     edgar_feats = calc_edgar_features(ticker, trade_date, cik_map)
@@ -940,7 +969,6 @@ def assemble_all(
     seed_registry: dict,
     seed_details: dict,
     control_registry: dict,
-    si_master: pd.DataFrame | None,
     halts: pd.DataFrame | None,
     cik_map: dict,
     sector_data: dict,
@@ -1086,7 +1114,6 @@ def assemble_all(
                 pm_1min_df=pm_1min_df,
                 float_data=float_data if isinstance(float_data, dict) else {},
                 earnings_dates=earnings_dates,
-                si_master=si_master,
                 halts=halts,
                 cik_map=cik_map,
                 sector_data=sector_data,
@@ -1180,7 +1207,7 @@ def main():
     log.info(f"Control registry: {len(control_registry)} days")
 
     # Load support data
-    si_master            = load_si_master()
+    load_si_master()  # builds _si_by_symbol index
     halts                = load_halts_master()
     _, cik_map = load_edgar_master()
 
@@ -1197,7 +1224,6 @@ def main():
         seed_registry=seed_registry,
         seed_details=seed_details,
         control_registry=control_registry,
-        si_master=si_master,
         halts=halts,
         cik_map=cik_map,
         sector_data=sector_data,

@@ -125,9 +125,13 @@ def get_next_trading_day(d: date) -> date | None:
 def load_si_master() -> pd.DataFrame | None:
     path = FINRA_DIR / "si_master.parquet"
     if path.exists():
-        df = pd.read_parquet(path)
-        log.info(f"SI master loaded: {len(df)} rows")
-        return df
+        try:
+            df = pd.read_parquet(path)
+            log.info(f"SI master loaded: {len(df)} rows")
+            return df
+        except Exception as e:
+            log.error(f"FAIL SI master corrupted: {e} — SI features will be -1")
+            return None
     log.warning("SI master not found — SI features will be -1")
     return None
 
@@ -135,10 +139,14 @@ def load_si_master() -> pd.DataFrame | None:
 def load_halts_master() -> pd.DataFrame | None:
     path = HALTS_DIR / "halts_master.parquet"
     if path.exists():
-        df = pd.read_parquet(path)
-        df.columns = [c.strip().lower().replace(" ","_") for c in df.columns]
-        log.info(f"Halts master loaded: {len(df)} rows")
-        return df
+        try:
+            df = pd.read_parquet(path)
+            df.columns = [c.strip().lower().replace(" ","_") for c in df.columns]
+            log.info(f"Halts master loaded: {len(df)} rows")
+            return df
+        except Exception as e:
+            log.error(f"FAIL Halts master corrupted: {e} — halt features will be 0")
+            return None
     log.warning("Halts master not found — halt features will be 0")
     return None
 
@@ -149,9 +157,12 @@ def load_edgar_master() -> tuple[pd.DataFrame | None, dict]:
     master = None
     cik_map = {}
     if master_path.exists():
-        master = pd.read_parquet(master_path)
-        master["filed_date"] = pd.to_datetime(master["filed"], errors="coerce").dt.date
-        log.info(f"EDGAR master loaded: {len(master)} filings")
+        try:
+            master = pd.read_parquet(master_path)
+            master["filed_date"] = pd.to_datetime(master["filed"], errors="coerce").dt.date
+            log.info(f"EDGAR master loaded: {len(master)} filings")
+        except Exception as e:
+            log.error(f"FAIL EDGAR master corrupted: {e} — EDGAR features will be 0")
     else:
         log.warning("EDGAR master not found — EDGAR features will be 0")
     if cik_path.exists():

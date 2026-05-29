@@ -23,10 +23,10 @@ POLYGON_API_KEY    = os.environ.get("MASSIVE_API_KEY", "")
 PUSHOVER_USER_KEY  = os.environ.get("PUSHOVER_USER_KEY", "utvy26j5q66kae27ncwxsftfcuhi92")
 PUSHOVER_APP_TOKEN = os.environ.get("PUSHOVER_APP_TOKEN", "a3szzncpvgyevbck6z5z5yszm7nzg3")
 
-MODEL_DIR        = Path(os.environ.get("MODEL_DIR",  "/data/models"))
-LOG_DIR          = Path(os.environ.get("LOG_DIR",    "/data/logs"))
-ALERT_DIR        = Path(os.environ.get("ALERT_DIR",  "/data/alerts"))
-DATA_SERVICE_URL = os.environ.get("DATA_SERVICE_URL", "https://thedeltav4-data-pull.onrender.com")
+MODEL_DIR   = Path(os.environ.get("MODEL_DIR",   "/opt/render/project/src/models"))
+SUPPORT_DIR = Path(os.environ.get("SUPPORT_DIR", "/opt/render/project/src/support"))
+LOG_DIR     = Path(os.environ.get("LOG_DIR",     "/data/logs"))
+ALERT_DIR   = Path(os.environ.get("ALERT_DIR",   "/data/alerts"))
 
 for d in [LOG_DIR, ALERT_DIR]:
     d.mkdir(parents=True, exist_ok=True)
@@ -252,25 +252,34 @@ def get_float(ticker):
     return -1, mc, is_foreign
 
 
-def get_si(ticker):
-    si_path = Path("/app/data/raw/finra/si_master.parquet")
-    if not si_path.exists(): return -1, -1
+# SI lookup cache — loaded once on startup
+_si_lookup = {}
+
+def load_si_lookup():
+    global _si_lookup
+    si_path = SUPPORT_DIR / "si_lookup.parquet"
+    if not si_path.exists():
+        log.warning(f"SI lookup not found: {si_path}")
+        return
     try:
         import pandas as pd
-        df   = pd.read_parquet(si_path, columns=["Date","Symbol","ShortVolume","TotalVolume"])
-        rows = df[df["Symbol"] == ticker].copy()
-        if rows.empty: return -1, -1
-        rows["_d"] = pd.to_datetime(rows["Date"], errors="coerce").dt.date
-        rows = rows.dropna(subset=["_d"]).sort_values("_d", ascending=False)
-        n = rows.iloc[0]
-        sv = float(n["ShortVolume"] or 0)
-        tv = float(n["TotalVolume"] or 0)
-        if tv > 0:
-            sp = (sv/tv)*100
-            tier = 0 if sp<5 else (1 if sp<15 else (2 if sp<30 else 3))
-            return round(sp,2), tier
+        df = pd.read_parquet(si_path)
+        for _, row in df.iterrows():
+            sym = str(row.get("Symbol",""))
+            if sym:
+                _si_lookup[sym] = {
+                    "si_pct":  float(row.get("si_pct", -1) or -1),
+                    "si_tier": int(row.get("si_tier", -1) or -1),
+                }
+        log.info(f"SI lookup loaded: {len(_si_lookup):,} tickers")
     except Exception as e:
-        log.warning(f"SI {ticker}: {e}")
+        log.error(f"FAIL load SI lookup: {e}")
+
+
+def get_si(ticker):
+    entry = _si_lookup.get(ticker)
+    if entry:
+        return entry["si_pct"], entry["si_tier"]
     return -1, -1
 
 
@@ -282,8 +291,8 @@ def get_edgar_features(ticker):
         "is_serial_diluter":0,"has_form4_buy":0,"has_sc13d":0,
         "days_since_dilution":999,
     }
-    ep = Path("/app/data/raw/edgar/filings_master.parquet")
-    cp = Path("/app/data/raw/edgar/cik_map.json")
+    ep = SUPPORT_DIR / "edgar_recent.parquet"
+    cp = SUPPORT_DIR / "cik_map.json"
     if not ep.exists() or not cp.exists(): return out
     try:
         import pandas as pd
@@ -745,6 +754,7 @@ def main():
     if not download_models():
         log.warning("Some models failed to download — will retry on next startup")
     load_models()
+    load_si_lookup()
     if not _models:
         log.error("No models loaded — check DATA_SERVICE_URL and model files")
     midnight_done = morning_done = False

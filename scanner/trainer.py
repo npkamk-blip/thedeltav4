@@ -58,7 +58,7 @@ XGB_PARAMS_BASE = {
     "eval_metric":        "aucpr",  # optimize for area under precision-recall curve
                                     # better than logloss for imbalanced data
     "early_stopping_rounds": 50,  # stop if no improvement for 50 rounds
-    "use_label_encoder":  False,
+    # "use_label_encoder": removed in XGBoost 2.0+
 }
 
 # Features to NEVER use as inputs (labels, identifiers, leakage)
@@ -256,7 +256,7 @@ def train_model(
 
     def safe_metrics(y_true, y_pred, threshold):
         if y_pred.sum() == 0:
-            return {"precision": 0, "recall": 0, "f1": 0, "tp": 0, "fp": 0, "fn": 0, "tn": 0}
+            return {"precision": 0, "recall": 0, "f1": 0, "tp": 0, "fp": 0, "fn": 0, "tn": 0, "alerts_per_day": 0}
         prec = precision_score(y_true, y_pred, zero_division=0)
         rec  = recall_score(y_true, y_pred, zero_division=0)
         f1   = f1_score(y_true, y_pred, zero_division=0)
@@ -443,15 +443,35 @@ def main():
     # ─────────────────────────────────────────────
     # TRAIN 4 MODELS
     # ─────────────────────────────────────────────
+    # NOTE: Both midnight and morning models predict "did this seed TODAY"
+    # The difference is FEATURES not label timing:
+    #   Midnight model: trained on morning dataset but only uses NON-PM features
+    #   Morning model:  trained on morning dataset using ALL features including PM
+    # This gives midnight ~841 positive examples instead of ~21
+    # ─────────────────────────────────────────────
     all_metrics = {}
     feature_cols_map = {}
 
-    # 1. Midnight seed
+    # Separate midnight features from morning features
+    # Midnight = morning features MINUS pm_ features
+    midnight_only_features = [f for f in morning_features if not f.startswith("pm_")]
+    log.info(f"Midnight model features (no PM): {len(midnight_only_features)}")
+    log.info(f"Morning model features (all):    {len(morning_features)}")
+
+    # Recalculate weights using morning dataset (correct labels)
+    mid_seed_weight  = calc_weight(morning_train, "label_seed")
+    mid_super_weight = calc_weight(morning_train, "label_super")
+
+    log.info(f"Corrected class weights (using morning labels):")
+    log.info(f"  midnight seed:  {mid_seed_weight}")
+    log.info(f"  midnight super: {mid_super_weight}")
+
+    # 1. Midnight seed — morning data, no PM features
     model_ms, cols_ms, metrics_ms = train_model(
         name="midnight_seed_model",
-        train_df=midnight_train,
-        test_df=midnight_test,
-        feature_cols=midnight_features,
+        train_df=morning_train,
+        test_df=morning_test,
+        feature_cols=midnight_only_features,
         label_col="label_seed",
         scale_pos_weight=mid_seed_weight,
     )
@@ -461,14 +481,14 @@ def main():
 
     gc.collect()
 
-    # 2. Midnight super
-    n_super_train = int(midnight_train["label_super"].sum()) if "label_super" in midnight_train.columns else 0
+    # 2. Midnight super — morning data, no PM features
+    n_super_train = int(morning_train["label_super"].sum()) if "label_super" in morning_train.columns else 0
     if n_super_train >= 10:
         model_msu, cols_msu, metrics_msu = train_model(
             name="midnight_super_model",
-            train_df=midnight_train,
-            test_df=midnight_test,
-            feature_cols=midnight_features,
+            train_df=morning_train,
+            test_df=morning_test,
+            feature_cols=midnight_only_features,
             label_col="label_super",
             scale_pos_weight=mid_super_weight,
         )
@@ -476,12 +496,12 @@ def main():
             all_metrics["midnight_super"] = metrics_msu
             feature_cols_map["midnight_super"] = cols_msu
     else:
-        log.warning(f"SKIP midnight_super | only {n_super_train} super events in training — falling back to seed model")
+        log.warning(f"SKIP midnight_super | only {n_super_train} super events in training")
         all_metrics["midnight_super"] = {"skipped": True, "reason": f"only {n_super_train} events"}
 
     gc.collect()
 
-    # 3. Morning seed
+    # 3. Morning seed — morning data, ALL features including PM
     model_mos, cols_mos, metrics_mos = train_model(
         name="morning_seed_model",
         train_df=morning_train,
@@ -496,7 +516,7 @@ def main():
 
     gc.collect()
 
-    # 4. Morning super
+    # 4. Morning super — morning data, ALL features
     n_super_mor = int(morning_train["label_super"].sum()) if "label_super" in morning_train.columns else 0
     if n_super_mor >= 10:
         model_mosu, cols_mosu, metrics_mosu = train_model(

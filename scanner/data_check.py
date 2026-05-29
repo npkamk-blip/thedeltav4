@@ -22,8 +22,8 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 ET = ZoneInfo("America/New_York")
 
 POLYGON_API_KEY = os.environ.get("MASSIVE_API_KEY", "")
-MODEL_DIR = Path(os.environ.get("MODEL_DIR", "/opt/render/project/src/models"))
-DATA_ROOT = Path("/app/data")
+MODEL_DIR   = Path(os.environ.get("MODEL_DIR",   "/opt/render/project/src/models"))
+SUPPORT_DIR = Path(os.environ.get("SUPPORT_DIR", "/opt/render/project/src/support"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -125,13 +125,13 @@ except Exception as e:
 # TEST 4: SI master
 # ─────────────────────────────────────────────
 log.info("TEST 4: SI master")
-si_path = DATA_ROOT / "raw/finra/si_master.parquet"
+si_path = SUPPORT_DIR / "si_lookup.parquet"
 if si_path.exists():
     try:
         import pandas as pd
-        df = pd.read_parquet(si_path, columns=["Date","Symbol","ShortVolume","TotalVolume"])
+        df = pd.read_parquet(si_path)
         rows = df[df["Symbol"] == "SPY"]
-        log.info(f"  ✅ SI master OK — {len(df):,} rows, SPY rows: {len(rows)}")
+        log.info(f"  ✅ SI lookup OK — {len(df):,} tickers, SPY rows: {len(rows)}")
         results["si_master"] = "OK"
     except Exception as e:
         log.error(f"  ❌ SI master read error: {e}")
@@ -144,8 +144,8 @@ else:
 # TEST 5: EDGAR master
 # ─────────────────────────────────────────────
 log.info("TEST 5: EDGAR master")
-edgar_path = DATA_ROOT / "raw/edgar/filings_master.parquet"
-cik_path   = DATA_ROOT / "raw/edgar/cik_map.json"
+edgar_path = SUPPORT_DIR / "edgar_recent.parquet"
+cik_path   = SUPPORT_DIR / "cik_map.json"
 if edgar_path.exists() and cik_path.exists():
     try:
         import pandas as pd

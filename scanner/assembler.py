@@ -901,6 +901,7 @@ def assemble_ticker_day(
 # ─────────────────────────────────────────────
 def assemble_all(
     seed_registry: dict,
+    seed_details: dict,
     control_registry: dict,
     si_master: pd.DataFrame | None,
     halts: pd.DataFrame | None,
@@ -1015,16 +1016,21 @@ def assemble_all(
             is_seed_today  = ticker in seed_tickers
             is_super_today = False
             if is_seed_today:
-                # Check in seed_details if it was a super
-                pass  # label_super set below
+                day_details = seed_details.get(date_str, {})
+                ticker_detail = day_details.get(ticker, {})
+                is_super_today = ticker_detail.get("type") == "super"
+
+            # Check if ticker is a super in next day seeds
+            next_day_details = seed_details.get(next_date_str, {}) if next_date_str else {}
+            is_super_next = next_day_details.get(ticker, {}).get("type") == "super"
 
             # Midnight label: will it seed TOMORROW?
             midnight_label_seed  = 1 if ticker in next_seeds else 0
-            midnight_label_super = 0  # simplified for now
+            midnight_label_super = 1 if is_super_next else 0
 
             # Morning label: did it seed TODAY?
             morning_label_seed  = 1 if is_seed_today else 0
-            morning_label_super = 0
+            morning_label_super = 1 if is_super_today else 0
 
             # Days since last seed
             ticker_seeds = seed_history.get(ticker, [])
@@ -1053,10 +1059,12 @@ def assemble_all(
                 avg_pm_vol=avg_pm_vol,
             )
 
-            if mid_row:
-                # Override labels with correct morning labels
-                mid_row["label_seed"]  = midnight_label_seed
-                mor_row["label_seed"]  = morning_label_seed
+            if mid_row and mor_row:
+                # Set correct labels
+                mid_row["label_seed"]   = midnight_label_seed
+                mid_row["label_super"]  = midnight_label_super
+                mor_row["label_seed"]   = morning_label_seed
+                mor_row["label_super"]  = morning_label_super
                 midnight_rows.append(mid_row)
                 morning_rows.append(mor_row)
 
@@ -1125,6 +1133,14 @@ def main():
     with open(ctrl_reg_path) as f:
         control_registry = json.load(f)
 
+    # Load seed details for super labels
+    seed_details = {}
+    seed_details_path = RAW_DIR / "seed_details.json"
+    if seed_details_path.exists():
+        with open(seed_details_path) as f:
+            seed_details = json.load(f)
+        log.info(f"Seed details loaded: {len(seed_details)} days")
+
     log.info(f"Seed registry: {len(seed_registry)} days")
     log.info(f"Control registry: {len(control_registry)} days")
 
@@ -1144,6 +1160,7 @@ def main():
     # Run assembly
     assemble_all(
         seed_registry=seed_registry,
+        seed_details=seed_details,
         control_registry=control_registry,
         si_master=si_master,
         halts=halts,

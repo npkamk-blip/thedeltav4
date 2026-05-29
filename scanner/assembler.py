@@ -495,7 +495,7 @@ def calc_si_features(ticker: str, trade_date: date, si_master=None) -> dict:
         return out
 
     # Get most recent SI reading before trade_date
-    nearest = rows.nlargest(1, "_date").iloc[0]
+    nearest = rows.sort_values("_date", ascending=False).iloc[0]
 
     try:
         short_vol = float(nearest["ShortVolume"] or 0)

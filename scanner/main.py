@@ -196,6 +196,53 @@ class PolygonClient:
         log.info(f"Universe: {len(tickers)} tickers")
         return tickers
 
+    def get_snapshot_universe(self):
+        """
+        Fast pre-filter using snapshot endpoint.
+        Returns only tickers matching price/volume criteria.
+        One API call per 250 tickers instead of 6 calls per ticker.
+        Cuts midnight scan from 2 hours to 20 minutes.
+        """
+        log.info("Fetching snapshot universe for pre-filter...")
+        tickers = self.get_tickers()
+        if not tickers:
+            return []
+
+        # Batch snapshot calls — 250 tickers at a time
+        candidates = []
+        batch_size = 250
+        batches = [tickers[i:i+batch_size] for i in range(0, len(tickers), batch_size)]
+
+        for i, batch in enumerate(batches):
+            ticker_str = ",".join(batch)
+            resp = self.get(
+                "/v2/snapshot/locale/us/markets/stocks/tickers",
+                {"tickers": ticker_str}
+            )
+            if not resp:
+                continue
+            for snap in resp.get("tickers", []):
+                t   = snap.get("ticker", "")
+                day = snap.get("day", {})
+                pc  = float(snap.get("prevDay", {}).get("c", 0) or 0)
+                vol = float(day.get("v", 0) or 0)
+                c   = float(day.get("c", 0) or pc)
+
+                # Apply basic filters
+                price = c if c > 0 else pc
+                if price < MIN_PRICE or price > MAX_PRICE:
+                    continue
+                if price * vol < MIN_DOLLAR_VOL and vol > 0:
+                    continue
+
+                candidates.append(t)
+
+            if i % 5 == 0:
+                log.info(f"Snapshot progress: {min((i+1)*batch_size, len(tickers))}/{len(tickers)} | candidates={len(candidates)}")
+
+        log.info(f"Snapshot pre-filter: {len(tickers)} → {len(candidates)} candidates")
+        return candidates
+
 poly = PolygonClient()
 
 
@@ -650,11 +697,32 @@ def format_alert(ticker, alert_type, scores, price, gap, float_M, si_pct, has_8k
     return title, msg
 
 
+def load_watchlist_from_disk():
+    """Load watchlist from disk if it exists and is from today."""
+    global _watchlist
+    wl_path = LOG_DIR / "watchlist.json"
+    if not wl_path.exists():
+        log.info("No saved watchlist found")
+        return
+    try:
+        with open(wl_path) as f:
+            data = json.load(f)
+        saved_date = data.get("date")
+        today = date.today().isoformat()
+        if saved_date == today:
+            _watchlist = data.get("watchlist", {})
+            log.info(f"Watchlist loaded from disk: {len(_watchlist)} stocks (from {saved_date})")
+        else:
+            log.info(f"Saved watchlist is from {saved_date}, today is {today} — ignoring")
+    except Exception as e:
+        log.warning(f"Could not load watchlist: {e}")
+
+
 def run_midnight_scan():
     global _watchlist
     log.info("="*50)
     log.info("MIDNIGHT SCAN — building watchlist")
-    tickers = poly.get_tickers()
+    tickers = poly.get_snapshot_universe()
     if not tickers:
         log.error("No tickers"); return
     candidates = {}
@@ -676,6 +744,18 @@ def run_midnight_scan():
                              key=lambda x:x[1].get("midnight_seed",0),
                              reverse=True)[:MAX_WATCHLIST])
     log.info(f"Watchlist built: {len(_watchlist)} stocks")
+
+    # Save watchlist to disk so it survives restarts
+    try:
+        wl_path = LOG_DIR / "watchlist.json"
+        with open(wl_path, "w") as f:
+            json.dump({
+                "date": date.today().isoformat(),
+                "watchlist": _watchlist,
+            }, f)
+        log.info(f"Watchlist saved to disk: {wl_path}")
+    except Exception as e:
+        log.warning(f"Could not save watchlist: {e}")
     top5 = list(_watchlist.items())[:5]
     lines = [f"Watchlist: {len(_watchlist)} stocks\n"]
     for t,s in top5:
@@ -765,6 +845,7 @@ def main():
         log.warning("Some models failed to download — will retry on next startup")
     load_models()
     load_si_lookup()
+    load_watchlist_from_disk()
     if not _models:
         log.error("No models loaded — check DATA_SERVICE_URL and model files")
     midnight_done = morning_done = False

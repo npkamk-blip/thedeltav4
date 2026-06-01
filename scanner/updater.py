@@ -190,6 +190,46 @@ def build_edgar_recent(edgar_master_path: Path) -> Path | None:
         return None
 
 
+def update_cik_map() -> bool:
+    """
+    Rebuild CIK map from SEC official ticker file.
+    Runs daily to catch new listings.
+    """
+    log.info("Updating CIK map from SEC...")
+    try:
+        r = requests.get(
+            "https://www.sec.gov/files/company_tickers.json",
+            headers={"User-Agent": EDGAR_USER_AGENT},
+            timeout=30
+        )
+        if r.status_code != 200:
+            log.warning(f"SEC ticker file HTTP {r.status_code}")
+            return False
+
+        data = r.json()
+        new_map = {}
+        for v in data.values():
+            ticker = v.get("ticker","").strip().upper()
+            cik    = str(v.get("cik_str","")).strip().zfill(10)
+            if ticker and cik:
+                new_map[ticker] = cik
+
+        # Save to disk
+        cik_path = DATA_ROOT / "raw/edgar/cik_map.json"
+        cik_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cik_path, "w") as f:
+            json.dump(new_map, f)
+        log.info(f"CIK map updated: {len(new_map):,} tickers")
+
+        # Push to GitHub
+        push_to_github(cik_path, "support/cik_map.json")
+        return True
+
+    except Exception as e:
+        log.error(f"FAIL update CIK map: {e}")
+        return False
+
+
 def get_edgar_quarter(d: date) -> str:
     """Return SEC quarter string like 2026q2"""
     q = (d.month - 1) // 3 + 1
@@ -460,6 +500,10 @@ def main():
         update_si()
     except Exception as e:
         log.error(f"Startup SI update error: {e}")
+    try:
+        update_cik_map()
+    except Exception as e:
+        log.error(f"Startup CIK map update error: {e}")
 
     edgar_updated_today = False
     si_updated_today    = False
@@ -480,13 +524,17 @@ def main():
 
         # EDGAR update — 6PM ET daily
         if hour == 18 and minute < 5 and not edgar_updated_today:
-            log.info("6PM — running EDGAR update...")
+            log.info("6PM — running EDGAR + CIK map update...")
             try:
                 success = update_edgar()
                 edgar_updated_today = True
                 log.info(f"EDGAR update: {'OK' if success else 'FAILED'}")
             except Exception as e:
                 log.error(f"EDGAR update error: {e}")
+            try:
+                update_cik_map()
+            except Exception as e:
+                log.error(f"CIK map update error: {e}")
 
         # SI update — check at 8AM daily (FINRA publishes overnight)
         if hour == 8 and minute < 5 and not si_updated_today:

@@ -703,11 +703,24 @@ def calc_pm_features_1min(pm_df: pd.DataFrame, trade_date: date,
     col_c = "c" if "c" in pm_day.columns else "close"
     col_v = "v" if "v" in pm_day.columns else "volume"
 
-    out["pm_open"]   = float(pm_day.iloc[0][col_o])
-    out["pm_high"]   = float(pm_day[col_h].max())
-    out["pm_low"]    = float(pm_day[col_l].min())
-    out["pm_close"]  = float(pm_day.iloc[-1][col_c])
-    out["pm_volume"] = float(pm_day[col_v].sum())
+    # ── PREDICTIVE ONLY: Use first 90 minutes (4:00-5:30AM) ──
+    # Training data must match production scoring window
+    # This prevents model from learning reactive patterns
+    # (e.g. "move already happened therefore it's a seed")
+    if "hour" in pm_day.columns and "minute" in pm_day.columns:
+        early = pm_day[
+            (pm_day["hour"] == 4) |
+            ((pm_day["hour"] == 5) & (pm_day["minute"] <= 30))
+        ].copy()
+        score_day = early if not early.empty else pm_day
+    else:
+        score_day = pm_day  # fallback if no hour column
+
+    out["pm_open"]   = float(pm_day.iloc[0][col_o])  # open stays full day
+    out["pm_high"]   = float(score_day[col_h].max())  # early high only
+    out["pm_low"]    = float(score_day[col_l].min())  # early low only
+    out["pm_close"]  = float(score_day.iloc[-1][col_c])  # 5:30AM price
+    out["pm_volume"] = float(score_day[col_v].sum())  # early volume only
 
     if prev_close > 0:
         out["pm_gap_pct"] = (out["pm_open"] - prev_close) / prev_close
@@ -718,31 +731,31 @@ def calc_pm_features_1min(pm_df: pd.DataFrame, trade_date: date,
     if avg_pm_vol and avg_pm_vol > 0:
         out["pm_vol_ratio"] = out["pm_volume"] / avg_pm_vol
 
-    # Volume build — second half bigger than first
-    if len(pm_day) >= 4:
-        half = len(pm_day) // 2
-        ev = pm_day.iloc[:half][col_v].mean()
-        lv = pm_day.iloc[half:][col_v].mean()
+    # Volume build — second half bigger than first (early window)
+    if len(score_day) >= 4:
+        half = len(score_day) // 2
+        ev = score_day.iloc[:half][col_v].mean()
+        lv = score_day.iloc[half:][col_v].mean()
         out["pm_volume_build"] = 1 if lv > ev * 1.2 else 0
 
-    # High of session
+    # High of early session (at 5:30AM price vs early high)
     if out["pm_close"] and out["pm_high"]:
-        out["pm_high_of_session"] = 1 if out["pm_close"] >= out["pm_high"] * 0.99 else 0
+        out["pm_high_of_session"] = 1 if out["pm_close"] >= out["pm_high"] * 0.95 else 0
 
-    # Fade
+    # Fade — did it fade from early high?
     if out["pm_high"] and out["pm_open"] and out["pm_high"] > out["pm_open"]:
         move = out["pm_high"] - out["pm_open"]
         fade = out["pm_high"] - out["pm_close"]
         out["pm_fade"] = 1 if fade > move * 0.10 else 0
 
-    # Remaining upside
+    # Remaining upside — capped at 0 (never negative)
     if out["pm_close"] and out["pm_close"] > 0:
         p = out["pm_close"]
-        out["pm_remaining_to_seed"]  = (prev_close * SEED_MULT  - p) / p
-        out["pm_remaining_to_super"] = (prev_close * SUPER_MULT - p) / p
+        out["pm_remaining_to_seed"]  = max(0, (prev_close * SEED_MULT  - p) / p)
+        out["pm_remaining_to_super"] = max(0, (prev_close * SUPER_MULT - p) / p)
 
-    # Consecutive bars with rising volume (fake move detector)
-    volumes = pm_day[col_v].values
+    # Use early window bars for volume features
+    volumes = score_day[col_v].values
     consec = 0
     for i in range(1, len(volumes)):
         if volumes[i] >= volumes[i-1]:

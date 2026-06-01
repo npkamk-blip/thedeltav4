@@ -330,6 +330,95 @@ def get_si(ticker):
     return -1, -1
 
 
+# Live 8K cache — checked once per hour
+_live_8k_cache = {}
+_live_8k_last_check = 0
+
+def check_live_8k_filings():
+    """
+    Check SEC EDGAR for 8-Ks filed in last 24 hours.
+    Uses SEC full-text search API — free, no auth needed.
+    Updates every 60 minutes.
+    """
+    global _live_8k_cache, _live_8k_last_check
+    now = time.time()
+    if now - _live_8k_last_check < 3600:  # cache 1 hour
+        return
+    try:
+        # SEC EDGAR full index for today
+        today = datetime.now(ET).strftime("%Y-%m-%d")
+        r = requests.get(
+            "https://efts.sec.gov/LATEST/search-index?q=%228-K%22&dateRange=custom"
+            f"&startdt={today}&enddt={today}&forms=8-K",
+            headers={"User-Agent": "NPKNOB@gmail.com"},
+            timeout=15
+        )
+        if r.status_code == 200:
+            data = r.json()
+            hits = data.get("hits", {}).get("hits", [])
+            new_cache = {}
+            for hit in hits:
+                src = hit.get("_source", {})
+                entity = src.get("entity_name", "")
+                tickers = src.get("file_num", "")
+                period = src.get("period_of_report", "")
+                # Store by entity name for lookup
+                new_cache[entity.upper()] = {
+                    "filed": src.get("file_date", today),
+                    "form": "8-K",
+                }
+            _live_8k_cache = new_cache
+            _live_8k_last_check = now
+            log.info(f"Live 8K cache updated: {len(_live_8k_cache)} filings today")
+    except Exception as e:
+        log.warning(f"Live 8K check failed: {e}")
+
+
+def get_live_8k(ticker: str) -> bool:
+    """Check if ticker filed an 8-K today using live SEC data."""
+    # Also check via SEC company search
+    try:
+        r = requests.get(
+            f"https://data.sec.gov/submissions/CIK{{}}.json",
+            headers={"User-Agent": "NPKNOB@gmail.com"},
+            timeout=10
+        )
+    except Exception:
+        pass
+
+    # Check CIK map
+    cik_path = SUPPORT_DIR / "cik_map.json"
+    if not cik_path.exists():
+        return False
+    try:
+        with open(cik_path) as f:
+            cik_map = json.load(f)
+        cik = cik_map.get(ticker)
+        if not cik:
+            return False
+        # Pad CIK to 10 digits
+        cik_padded = str(cik).strip().zfill(10)
+        r = requests.get(
+            f"https://data.sec.gov/submissions/CIK{cik_padded}.json",
+            headers={"User-Agent": "NPKNOB@gmail.com"},
+            timeout=10
+        )
+        if r.status_code == 200:
+            data = r.json()
+            recent = data.get("filings", {}).get("recent", {})
+            forms = recent.get("form", [])
+            dates = recent.get("filingDate", [])
+            today = datetime.now(ET).strftime("%Y-%m-%d")
+            yesterday = (datetime.now(ET) - timedelta(days=1)).strftime("%Y-%m-%d")
+            for form, filed in zip(forms, dates):
+                if form in ("8-K", "8-K/A") and filed in (today, yesterday):
+                    log.info(f"Live 8K found: {ticker} filed {form} on {filed}")
+                    return True
+    except Exception as e:
+        log.debug(f"Live 8K check {ticker}: {e}")
+    return False
+
+
 def get_edgar_features(ticker):
     out = {
         "has_8k":0,"has_8k_yesterday":0,"has_8k_2days_ago":0,
@@ -361,6 +450,11 @@ def get_edgar_features(ticker):
         if not ek[ek["fd"]==today].empty:  out["has_8k"]=1
         if not ek[ek["fd"]==yest].empty:   out["has_8k_yesterday"]=1
         if not ek[ek["fd"]==two].empty:    out["has_8k_2days_ago"]=1
+        # Also check live SEC data for today's 8Ks
+        if out["has_8k"] == 0:
+            if get_live_8k(ticker):
+                out["has_8k"] = 1
+                log.info(f"Live 8K confirmed: {ticker}")
         rec = ek[ek["fd"]>=two]
         if not rec.empty:
             try:
@@ -744,6 +838,50 @@ def run_midnight_scan():
                              key=lambda x:x[1].get("midnight_seed",0),
                              reverse=True)[:MAX_WATCHLIST])
     log.info(f"Watchlist built: {len(_watchlist)} stocks")
+
+    # ── Fire midnight seed alerts for high conviction plays ──
+    log.info("Checking for midnight seed alerts...")
+    midnight_alerts = 0
+    for ticker, data in _watchlist.items():
+        mid_score = data.get("midnight_seed", 0)
+        if mid_score < 0.55:
+            continue
+        pc = data.get("prev_close", 0)
+        pv = data.get("prev_vol", 0)
+        if pc <= 0:
+            continue
+        ah_bars  = get_ah_bars(ticker)
+        ah_feats = calc_ah_features(ah_bars, pc)
+        edgar    = get_edgar_features(ticker)
+        ah_move      = ah_feats.get("ah_move_pct", 0)
+        ah_vol       = ah_feats.get("ah_volume", 0)
+        ah_sus       = ah_feats.get("ah_sustained", 0)
+        has_8k       = edgar.get("has_8k", 0)
+        ah_vol_ratio = ah_vol / pv if pv > 0 else 0
+        has_catalyst = (
+            has_8k == 1 or
+            abs(ah_move) > 0.05 or
+            ah_vol_ratio > 2.0 or
+            ah_sus == 1
+        )
+        if has_catalyst:
+            mid_super  = data.get("midnight_super", 0)
+            alert_type = "super" if mid_super >= 0.48 else "seed"
+            emoji      = "🚀" if alert_type == "super" else "🌱"
+            title = f"{emoji} MIDNIGHT {alert_type.upper()} — {ticker}"
+            msg = (
+                f"Score: {mid_score:.3f} | Super: {mid_super:.3f}\\n"
+                f"AH move: {ah_move*100:+.1f}%\\n"
+                f"AH vol ratio: {ah_vol_ratio:.1f}x\\n"
+                f"8K: {'YES 🔥' if has_8k else 'no'}\\n"
+                f"Close: ${pc:.3f}\\n"
+                f"Set limit buy for 4AM open"
+            )
+            send_pushover(title, msg, alert_type, priority=1)
+            log_alert(ticker, f"midnight_{alert_type}", data, pc, 0)
+            midnight_alerts += 1
+            log.info(f"MIDNIGHT ALERT {alert_type.upper()} {ticker} score={mid_score:.3f} 8k={has_8k} ah={ah_move*100:+.1f}%")
+    log.info(f"Midnight alerts fired: {midnight_alerts}")
 
     # Save watchlist to disk so it survives restarts
     try:

@@ -184,7 +184,7 @@ class PolygonClient:
 
     def get_tickers(self):
         results = self.paginate("/v3/reference/tickers", {
-            "market": "stocks", "exchange": "XNAS,XNYS,XASE",
+            "market": "stocks",
             "active": "true", "type": "CS", "limit": 1000,
         })
         tickers = []
@@ -289,7 +289,9 @@ def get_edgar_features(ticker):
         "8k_filing_hour":0,"hours_before_open":0,
         "has_dilution":0,"dilution_count_6m":0,"dilution_count_30d":0,
         "is_serial_diluter":0,"has_form4_buy":0,"has_sc13d":0,
-        "days_since_dilution":999,
+        "days_since_dilution":999,"form4_buy_count":0,
+        "has_merger":0,"has_fda":0,"has_contract":0,
+        "has_reverse_split":0,"has_buyback":0,
     }
     ep = SUPPORT_DIR / "edgar_recent.parquet"
     cp = SUPPORT_DIR / "cik_map.json"
@@ -329,11 +331,19 @@ def get_edgar_features(ticker):
         if not dp.empty:
             out["days_since_dilution"] = (today - dp["fd"].max()).days
         f4 = rows[rows["form_type"].isin(["4","4/A"])]
-        if not f4[(f4["fd"]>=thirty)&(f4["fd"]<today)].empty:
+        f4_recent = f4[(f4["fd"]>=thirty)&(f4["fd"]<today)]
+        if not f4_recent.empty:
             out["has_form4_buy"]=1
+        out["form4_buy_count"] = len(f4_recent)
         sc = rows[rows["form_type"].isin(["SC 13D","SC 13D/A"])]
         if not sc[(sc["fd"]>=six_m)&(sc["fd"]<today)].empty:
             out["has_sc13d"]=1
+        # Text-based features — not available from EDGAR index, default 0
+        out["has_merger"]        = 0
+        out["has_fda"]           = 0
+        out["has_contract"]      = 0
+        out["has_reverse_split"] = 0
+        out["has_buyback"]       = 0
     except Exception as e:
         log.warning(f"EDGAR {ticker}: {e}")
     return out

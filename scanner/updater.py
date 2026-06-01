@@ -48,19 +48,148 @@ EDGAR_USER_AGENT = os.environ.get("EDGAR_USER_AGENT", "NPKNOB@gmail.com")
 # ─────────────────────────────────────────────
 # KEEPALIVE
 # ─────────────────────────────────────────────
-class _Health(BaseHTTPRequestHandler):
+MODEL_DIR    = Path(os.environ.get("DATA_DIR", "/app/data")) / "models"
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO  = os.environ.get("GITHUB_REPO", "npkamk-blip/thedeltav4")
+
+class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200); self.end_headers()
-        self.wfile.write(b"alive")
+        path = self.path.split("?")[0]
+
+        # Health check
+        if path == "/health":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"alive")
+            return
+
+        # Serve model files
+        # GET /models/midnight_seed_model.json
+        # GET /models/feature_cols.json
+        # GET /models/thresholds.json
+        if path.startswith("/models/"):
+            filename = path.split("/models/")[-1]
+            # Only allow known model files
+            allowed = {
+                "midnight_seed_model.json",
+                "midnight_super_model.json",
+                "morning_seed_model.json",
+                "morning_super_model.json",
+                "feature_cols.json",
+                "thresholds.json",
+            }
+            if filename not in allowed:
+                self.send_response(404)
+                self.end_headers()
+                return
+            file_path = MODEL_DIR / filename
+            if not file_path.exists():
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(f"File not found: {filename}".encode())
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(file_path.stat().st_size))
+            self.end_headers()
+            with open(file_path, "rb") as f:
+                self.wfile.write(f.read())
+            log.info(f"Served model: {filename}")
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
     def log_message(self, *a): pass
 
 def start_keepalive(port=8080):
-    HTTPServer(("0.0.0.0", port), _Health).serve_forever()
+    HTTPServer(("0.0.0.0", port), _Handler).serve_forever()
 
 
 # ─────────────────────────────────────────────
 # EDGAR DAILY UPDATE
 # ─────────────────────────────────────────────
+def push_to_github(local_path: Path, github_path: str) -> bool:
+    """Push a file to GitHub via API."""
+    if not GITHUB_TOKEN:
+        log.warning("No GITHUB_TOKEN — skipping push")
+        return False
+    try:
+        import base64
+        with open(local_path, "rb") as f:
+            content_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        # Get existing SHA
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{github_path}"
+        headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+        r = requests.get(url, headers=headers, timeout=15)
+        sha = r.json().get("sha") if r.status_code == 200 else None
+
+        payload = {
+            "message": f"Auto-update {github_path.split('/')[-1]}",
+            "content": content_b64,
+        }
+        if sha:
+            payload["sha"] = sha
+
+        r = requests.put(url, headers=headers, json=payload, timeout=60)
+        if r.status_code in (200, 201):
+            log.info(f"Pushed to GitHub: {github_path} ({local_path.stat().st_size:,} bytes)")
+            return True
+        else:
+            log.error(f"GitHub push failed: {github_path} HTTP {r.status_code}")
+            return False
+    except Exception as e:
+        log.error(f"GitHub push error {github_path}: {e}")
+        return False
+
+
+def build_si_lookup(si_master_path: Path) -> Path | None:
+    """Build lightweight si_lookup.parquet from full si_master."""
+    try:
+        import pandas as pd
+        si = pd.read_parquet(si_master_path, columns=["Date","Symbol","ShortVolume","TotalVolume"])
+        si["_date"] = pd.to_datetime(si["Date"], errors="coerce").dt.date
+        si = si.dropna(subset=["_date","Symbol"])
+        latest = si.sort_values("_date").groupby("Symbol").last().reset_index()
+        latest = latest[["Symbol","ShortVolume","TotalVolume","_date"]]
+        latest["si_pct"] = (
+            latest["ShortVolume"] /
+            latest["TotalVolume"].replace(0, float("nan")) * 100
+        ).round(2)
+        latest["si_tier"] = latest["si_pct"].apply(
+            lambda x: 0 if x < 5 else (1 if x < 15 else (2 if x < 30 else 3))
+            if pd.notna(x) else -1
+        )
+        out_path = DATA_ROOT / "support" / "si_lookup.parquet"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        latest.to_parquet(out_path, index=False)
+        log.info(f"Built si_lookup: {len(latest):,} tickers ({out_path.stat().st_size:,} bytes)")
+        return out_path
+    except Exception as e:
+        log.error(f"FAIL build si_lookup: {e}")
+        return None
+
+
+def build_edgar_recent(edgar_master_path: Path) -> Path | None:
+    """Build lightweight edgar_recent.parquet from full master."""
+    try:
+        import pandas as pd
+        from datetime import timedelta
+        edgar = pd.read_parquet(edgar_master_path, columns=["cik","form_type","filed","filename"])
+        edgar["filed_date"] = pd.to_datetime(edgar["filed"], errors="coerce").dt.date
+        cutoff = date.today() - timedelta(days=90)
+        recent = edgar[edgar["filed_date"] >= cutoff].copy()
+        out_path = DATA_ROOT / "support" / "edgar_recent.parquet"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        recent.to_parquet(out_path, index=False)
+        log.info(f"Built edgar_recent: {len(recent):,} filings ({out_path.stat().st_size:,} bytes)")
+        return out_path
+    except Exception as e:
+        log.error(f"FAIL build edgar_recent: {e}")
+        return None
+
+
 def get_edgar_quarter(d: date) -> str:
     """Return SEC quarter string like 2026q2"""
     q = (d.month - 1) // 3 + 1
@@ -152,6 +281,12 @@ def update_edgar():
             combined.to_parquet(master_path, index=False)
             new_count = len(combined) - len(existing)
             log.info(f"EDGAR master updated: +{new_count} new filings ({len(combined):,} total)")
+
+            # Build edgar_recent and push to GitHub
+            recent_path = build_edgar_recent(master_path)
+            if recent_path:
+                push_to_github(recent_path, "support/edgar_recent.parquet")
+
             return True
 
         except Exception as e:
@@ -164,6 +299,12 @@ def update_edgar():
         # No existing master — save fresh
         new_df.to_parquet(master_path, index=False)
         log.info(f"EDGAR master created: {len(new_df):,} filings")
+
+        # Build edgar_recent and push to GitHub
+        recent_path = build_edgar_recent(master_path)
+        if recent_path:
+            push_to_github(recent_path, "support/edgar_recent.parquet")
+
         return True
 
 
@@ -285,6 +426,12 @@ def update_si():
         log.info(f"SI master rebuilt: {len(master):,} rows from {len(files)} files")
         del master, all_rows
         gc.collect()
+
+        # Build si_lookup and push to GitHub
+        lookup_path = build_si_lookup(master_path)
+        if lookup_path:
+            push_to_github(lookup_path, "support/si_lookup.parquet")
+
         return True
 
     return False

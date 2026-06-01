@@ -38,7 +38,7 @@ MAX_WATCHLIST  = 150
 MAX_FLOAT_M    = 200.0
 
 MIDNIGHT_THRESHOLD      = 0.45
-MORNING_SEED_THRESHOLD  = 0.55
+MORNING_SEED_THRESHOLD  = 0.70   # high conviction only
 MORNING_SUPER_THRESHOLD = 0.50
 
 MORNING_SCORE_HOUR = 5
@@ -748,9 +748,11 @@ def run_midnight_scan():
     # Save watchlist to disk so it survives restarts
     try:
         wl_path = LOG_DIR / "watchlist.json"
+        # Save as tomorrow's date since this watchlist is for next morning
+        tomorrow = (date.today() + timedelta(days=1)).isoformat()
         with open(wl_path, "w") as f:
             json.dump({
-                "date": date.today().isoformat(),
+                "date": tomorrow,
                 "watchlist": _watchlist,
             }, f)
         log.info(f"Watchlist saved to disk: {wl_path}")
@@ -782,6 +784,24 @@ def run_morning_scan():
             pm = get_pm_bars(ticker)
             price = float(pm[-1].get("c",pc) or pc) if pm else pc
             gap   = (price-pc)/pc if pc>0 else 0
+
+            # ── Gap filters — only alert on true early movers ──
+            # Skip if not moving yet
+            if gap < 0.02:
+                log.debug(f"SKIP {ticker} — gap too small ({gap*100:.1f}%)")
+                continue
+            # Skip if gap already huge — move likely done
+            if gap > 0.40:
+                log.debug(f"SKIP {ticker} — gap too large ({gap*100:.1f}%)")
+                continue
+            # Skip if faded hard from PM high — pump and dump
+            if pm:
+                pm_high = max(float(b.get("h",0) or 0) for b in pm)
+                if pm_high > 0:
+                    pm_fade = (pm_high - price) / pm_high
+                    if pm_fade > 0.25:
+                        log.debug(f"SKIP {ticker} — faded {pm_fade*100:.1f}% from PM high")
+                        continue
             float_M,_,_ = get_float(ticker)
             si_pct,_    = get_si(ticker)
             edgar       = get_edgar_features(ticker)

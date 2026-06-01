@@ -690,14 +690,19 @@ def calc_pm_features(pm_bars, prev_close, avg_pm_vol=0):
     }
     if not pm_bars or prev_close<=0: return out
 
-    # ── PREDICTIVE SCORING: Use only first 90 minutes (4:00-5:30AM) ──
-    # This prevents scoring based on moves that already happened
-    # pm_high, pm_move_pct etc use EARLY bars only
-    # So model predicts from early signals not completed moves
-    early_bars = [b for b in pm_bars
-                  if b.get("hour",0) == 4 or
-                  (b.get("hour",0) == 5 and b.get("minute",0) <= 30)]
-    score_bars = early_bars if early_bars else pm_bars
+    # ── PREDICTIVE SCORING: Rolling 90-minute window ──
+    # At 5:30AM: uses 4:00-5:30AM bars
+    # At 8:00AM: uses 6:30-8:00AM bars (most recent 90 min)
+    # Keeps scoring predictive at any scan time
+    # Catches late movers like TGHL that start building after 5:30AM
+    now_et = datetime.now(ET)
+    window_end   = now_et.hour * 60 + now_et.minute
+    window_start = window_end - 90
+
+    window_bars = [b for b in pm_bars
+                   if (b.get("hour",0)*60 + b.get("minute",0)) >= window_start
+                   and (b.get("hour",0)*60 + b.get("minute",0)) <= window_end]
+    score_bars = window_bars if window_bars else pm_bars
 
     out["pm_open"]   = float(pm_bars[0].get("o",0) or 0)
     # Use EARLY high not session high — prevents reactive scoring
@@ -1232,12 +1237,20 @@ def main():
             log.info("5:30AM — morning scan")
             try: run_morning_scan(); morning_done=True
             except Exception as e: log.error(f"Morning error: {e}")
-        in_pm = (hour>=4) and (hour<9 or (hour==9 and minute<30))
-        if in_pm and morning_done:
+
+        # Rolling rescan every 5 min from 5:30AM to 9:15AM
+        # Catches late movers like TGHL (flat at 5:30, explodes at 8AM)
+        # Only rescans stocks not already alerted
+        in_rescan_window = (
+            morning_done and
+            (hour > 5 or (hour == 5 and minute >= 30)) and
+            (hour < 9 or (hour == 9 and minute < 15))
+        )
+        if in_rescan_window and minute % 5 == 0:
+            log.info(f"Rolling rescan {hour}:{minute:02d}AM")
             try: run_morning_scan()
-            except Exception as e: log.warning(f"PM rescan: {e}")
-            time.sleep(SCAN_INTERVAL)
-            continue
+            except Exception as e: log.warning(f"Rescan error: {e}")
+
         log.debug(f"Resting ({hour}:{minute:02d} ET)")
         time.sleep(60)
 

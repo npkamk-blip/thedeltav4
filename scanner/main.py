@@ -38,7 +38,7 @@ MAX_WATCHLIST  = 150
 MAX_FLOAT_M    = 200.0
 
 MIDNIGHT_THRESHOLD      = 0.45
-MORNING_SEED_THRESHOLD  = 0.50   # high conviction only
+MORNING_SEED_THRESHOLD  = 0.70   # high conviction only
 MORNING_SUPER_THRESHOLD = 0.50
 
 MORNING_SCORE_HOUR = 5
@@ -228,7 +228,12 @@ class PolygonClient:
                 vol = float(day.get("v", 0) or 0)
                 c   = float(day.get("c", 0) or pc)
 
-                # Apply basic filters
+                # Apply basic filters — price and volume ONLY
+                # We intentionally keep "risky" stocks:
+                #   foreign issuers (HKIT, HUBC, TGHL = biggest movers)
+                #   noncompliant listings (tiny float = fuel)
+                #   recent reverse splits (shrinks float = explosive)
+                # Model scores them — gap/fade filters handle quality
                 price = c if c > 0 else pc
                 if price < MIN_PRICE or price > MAX_PRICE:
                     continue
@@ -321,6 +326,156 @@ def load_si_lookup():
         log.info(f"SI lookup loaded: {len(_si_lookup):,} tickers")
     except Exception as e:
         log.error(f"FAIL load SI lookup: {e}")
+
+
+def get_polygon_news(ticker: str, hours_back: int = 14) -> list:
+    """
+    Get recent news for a ticker from Polygon API.
+    Covers GlobeNewswire, PR Newswire, Benzinga, Business Wire etc.
+    hours_back: how many hours to look back (default 14 = since yesterday 9AM)
+    """
+    try:
+        from datetime import timezone
+        cutoff = (datetime.now(ET) - timedelta(hours=hours_back))
+        cutoff_utc = cutoff.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        resp = poly.get(
+            "/v2/reference/news",
+            {
+                "ticker":             ticker,
+                "limit":              10,
+                "published_utc.gte":  cutoff_utc,
+                "order":              "desc",
+            }
+        )
+        if resp and resp.get("results"):
+            return resp["results"]
+    except Exception as e:
+        log.debug(f"News fetch {ticker}: {e}")
+    return []
+
+
+# ─────────────────────────────────────────────
+# NEWS ANALYSIS
+# ─────────────────────────────────────────────
+
+# Predictive catalyst keywords — company ANNOUNCING something
+# These appear BEFORE the move
+PREDICTIVE_BULLISH = [
+    "announces", "signs", "awarded", "secures", "launches",
+    "partnership", "agreement", "contract", "deal", "merger",
+    "acquisition", "approved", "clearance", "grant", "fda",
+    "compliance", "regains", "uplisting", "investment",
+    "milestone", "breakthrough", "expansion", "order",
+    "collaboration", "license", "appointed", "joins",
+    "selected", "wins", "receives", "completes",
+]
+
+# Reactive keywords — describing a move already happening
+# These appear AFTER the move — skip them
+REACTIVE_KEYWORDS = [
+    "jumps", "surges", "soars", "spikes", "rallies",
+    "gains", "rises", "climbs", "up today", "why is",
+    "what is driving", "moving higher", "trading higher",
+    "pre-market", "premarket", "day traders",
+    "momentum", "short squeeze", "heavily traded",
+    "most active", "trending",
+]
+
+# Bearish keywords — avoid these stocks
+BEARISH_KEYWORDS = [
+    # True bearish — company selling shares or in serious trouble
+    "dilution", "direct offering", "registered direct",
+    "prospectus supplement", "shelf offering",
+    "default", "bankruptcy", "going concern",
+    "fraud", "ponzi", "sec charges",
+    # NOT including: reverse split, noncompliant, lawsuit
+    # These are often present on the biggest movers
+]
+
+# Trusted publishers for catalyst news
+CATALYST_PUBLISHERS = [
+    "globenewswire", "prnewswire", "businesswire",
+    "accesswire", "globe newswire", "pr newswire",
+    "business wire", "accesswire",
+]
+
+
+def analyze_news(news_items: list) -> dict:
+    """
+    Analyze news for PREDICTIVE catalysts only.
+    Filters out reactive news that describes moves already happening.
+    
+    Predictive = company announcement published after market close
+    Reactive   = article describing a price move already in progress
+    """
+    out = {
+        "has_news_tonight":  0,
+        "has_bullish_pr":    0,
+        "has_bearish_pr":    0,
+        "has_reactive_news": 0,
+        "news_count":        len(news_items),
+        "news_publishers":   "",
+        "news_title":        "",
+    }
+    if not news_items:
+        return out
+
+    from datetime import timezone
+    now_et = datetime.now(ET)
+
+    # Define predictive window: 4PM yesterday to 11PM tonight
+    # News published during this window = catalyst not yet priced in
+    market_close_yesterday = now_et.replace(
+        hour=16, minute=0, second=0, microsecond=0
+    ) - timedelta(days=1)
+
+    for item in news_items:
+        title = (item.get("title","") or "").lower()
+        pub   = (item.get("publisher",{}).get("name","") or "").lower()
+        pub_time_str = item.get("published_utc","")
+
+        # Parse publication time
+        try:
+            from datetime import timezone as tz
+            pub_time = datetime.fromisoformat(
+                pub_time_str.replace("Z","+00:00")
+            ).astimezone(ET)
+        except Exception:
+            pub_time = now_et
+
+        # Check if reactive (describing a move)
+        is_reactive = any(kw in title for kw in REACTIVE_KEYWORDS)
+
+        # Check if published in predictive window (after market close)
+        in_window = pub_time >= market_close_yesterday
+
+        # Check publisher (catalyst publishers vs financial media)
+        is_catalyst_publisher = any(p in pub for p in CATALYST_PUBLISHERS)
+
+        # Bearish check
+        if any(kw in title for kw in BEARISH_KEYWORDS):
+            out["has_bearish_pr"] = 1
+
+        # Predictive bullish:
+        # Published after market close AND
+        # Has bullish announcement keywords AND
+        # NOT reactive (not describing a move) AND
+        # From a catalyst publisher (not financial media)
+        if (
+            in_window and
+            not is_reactive and
+            is_catalyst_publisher and
+            any(kw in title for kw in PREDICTIVE_BULLISH)
+        ):
+            out["has_bullish_pr"]   = 1
+            out["has_news_tonight"] = 1
+            out["news_title"]       = item.get("title","")[:80]
+            out["news_publishers"]  = pub
+
+        if is_reactive:
+            out["has_reactive_news"] = 1
+
+    return out
 
 
 def get_si(ticker):
@@ -479,12 +634,25 @@ def get_edgar_features(ticker):
         sc = rows[rows["form_type"].isin(["SC 13D","SC 13D/A"])]
         if not sc[(sc["fd"]>=six_m)&(sc["fd"]<today)].empty:
             out["has_sc13d"]=1
-        # Text-based features — not available from EDGAR index, default 0
-        out["has_merger"]        = 0
-        out["has_fda"]           = 0
-        out["has_contract"]      = 0
-        out["has_reverse_split"] = 0
-        out["has_buyback"]       = 0
+        # Detect merger/acquisition from form types
+        # 6-K is used by foreign private issuers (TGHL, HKIT, HUBC etc)
+        # 8-K item 1.01 = entry into material agreement = merger/deal
+        merger_forms = rows[rows["form_type"].isin(["6-K","6-K/A","SC TO-T","SC TO-I","DEFM14A","PREM14A"])]
+        if not merger_forms[(merger_forms["fd"]>=thirty)&(merger_forms["fd"]<today)].empty:
+            out["has_merger"] = 1
+
+        # Reverse split detection from 8-K and 6-K filings
+        rsplit_forms = rows[rows["form_type"].isin(["8-K","8-K/A","6-K","6-K/A"])]
+        rsplit_recent = rsplit_forms[(rsplit_forms["fd"]>=thirty)&(rsplit_forms["fd"]<today)]
+        if not rsplit_recent.empty:
+            # Check filename for reverse split keywords
+            filenames = rsplit_recent["filename"].str.lower().fillna("")
+            if filenames.str.contains("reverse|split|consolidat").any():
+                out["has_reverse_split"] = 1
+
+        out["has_fda"]      = 0
+        out["has_contract"] = 0
+        out["has_buyback"]  = 0
     except Exception as e:
         log.warning(f"EDGAR {ticker}: {e}")
     return out
@@ -521,31 +689,51 @@ def calc_pm_features(pm_bars, prev_close, avg_pm_vol=0):
         "pm_vol_acceleration":0,"pm_gap_start_hour":0,
     }
     if not pm_bars or prev_close<=0: return out
+
+    # ── PREDICTIVE SCORING: Use only first 90 minutes (4:00-5:30AM) ──
+    # This prevents scoring based on moves that already happened
+    # pm_high, pm_move_pct etc use EARLY bars only
+    # So model predicts from early signals not completed moves
+    early_bars = [b for b in pm_bars
+                  if b.get("hour",0) == 4 or
+                  (b.get("hour",0) == 5 and b.get("minute",0) <= 30)]
+    score_bars = early_bars if early_bars else pm_bars
+
     out["pm_open"]   = float(pm_bars[0].get("o",0) or 0)
-    out["pm_high"]   = max(float(b.get("h",0) or 0) for b in pm_bars)
-    out["pm_low"]    = min(float(b.get("l",0) or 0) for b in pm_bars if b.get("l",0)>0) if pm_bars else 0
-    out["pm_close"]  = float(pm_bars[-1].get("c",0) or 0)
-    out["pm_volume"] = sum(float(b.get("v",0) or 0) for b in pm_bars)
+    # Use EARLY high not session high — prevents reactive scoring
+    out["pm_high"]   = max(float(b.get("h",0) or 0) for b in score_bars) if score_bars else 0
+    out["pm_low"]    = min(float(b.get("l",0) or 0) for b in score_bars if b.get("l",0)>0) if score_bars else 0
+    out["pm_close"]  = float(score_bars[-1].get("c",0) or 0) if score_bars else 0
+    out["pm_volume"] = sum(float(b.get("v",0) or 0) for b in score_bars)
     if prev_close>0 and out["pm_open"]>0:
         out["pm_gap_pct"]  = (out["pm_open"]-prev_close)/prev_close
+    # pm_move_pct = early move only, not full session
     if out["pm_open"]>0 and out["pm_high"]>0:
         out["pm_move_pct"] = (out["pm_high"]-out["pm_open"])/out["pm_open"]
     if avg_pm_vol>0:
         out["pm_vol_ratio"] = out["pm_volume"]/avg_pm_vol
-    vols = [float(b.get("v",0) or 0) for b in pm_bars]
+    # Use early bars for volume features — predictive not reactive
+    vols = [float(b.get("v",0) or 0) for b in score_bars]
     if len(vols)>=4:
         h  = len(vols)//2
         ev = np.mean(vols[:h]); lv = np.mean(vols[h:])
         out["pm_volume_build"] = 1 if lv>ev*1.2 else 0
+    # Is price at the HIGH of early session (not fading)?
+    # Uses early bars only — predictive signal
     if out["pm_close"] and out["pm_high"]:
-        out["pm_high_of_session"] = 1 if out["pm_close"]>=out["pm_high"]*0.99 else 0
+        out["pm_high_of_session"] = 1 if out["pm_close"]>=out["pm_high"]*0.95 else 0
     if out["pm_high"] and out["pm_open"] and out["pm_high"]>out["pm_open"]:
         move = out["pm_high"]-out["pm_open"]
         fade = out["pm_high"]-out["pm_close"]
         out["pm_fade"] = 1 if fade>move*0.10 else 0
     if out["pm_close"]>0:
-        out["pm_remaining_to_seed"]  = (prev_close*2.0-out["pm_close"])/out["pm_close"]
-        out["pm_remaining_to_super"] = (prev_close*3.5-out["pm_close"])/out["pm_close"]
+        # How much room LEFT to seed — capped at 0 minimum
+        # Negative = already seeded (reactive), set to 0
+        remaining_seed  = (prev_close*2.0-out["pm_close"])/out["pm_close"]
+        remaining_super = (prev_close*3.5-out["pm_close"])/out["pm_close"]
+        # Only use if stock still has room to run (not already seeded)
+        out["pm_remaining_to_seed"]  = max(0, remaining_seed)
+        out["pm_remaining_to_super"] = max(0, remaining_super)
     if len(vols)>1:
         c=0
         for i in range(1,len(vols)):
@@ -850,16 +1038,24 @@ def run_midnight_scan():
         pv = data.get("prev_vol", 0)
         if pc <= 0:
             continue
-        ah_bars  = get_ah_bars(ticker)
-        ah_feats = calc_ah_features(ah_bars, pc)
-        edgar    = get_edgar_features(ticker)
+        ah_bars   = get_ah_bars(ticker)
+        ah_feats  = calc_ah_features(ah_bars, pc)
+        edgar     = get_edgar_features(ticker)
+        news      = get_polygon_news(ticker, hours_back=14)
+        news_info = analyze_news(news)
         ah_move      = ah_feats.get("ah_move_pct", 0)
         ah_vol       = ah_feats.get("ah_volume", 0)
         ah_sus       = ah_feats.get("ah_sustained", 0)
         has_8k       = edgar.get("has_8k", 0)
+        has_news     = news_info.get("has_bullish_pr", 0)
+        has_bad_news = news_info.get("has_bearish_pr", 0)
         ah_vol_ratio = ah_vol / pv if pv > 0 else 0
+        if has_bad_news:
+            log.debug(f"SKIP {ticker} — bearish news")
+            continue
         has_catalyst = (
             has_8k == 1 or
+            has_news == 1 or
             abs(ah_move) > 0.05 or
             ah_vol_ratio > 2.0 or
             ah_sus == 1
@@ -869,12 +1065,14 @@ def run_midnight_scan():
             alert_type = "super" if mid_super >= 0.48 else "seed"
             emoji      = "🚀" if alert_type == "super" else "🌱"
             title = f"{emoji} MIDNIGHT {alert_type.upper()} — {ticker}"
+            news_line  = f"NEWS: {news_info['news_title'][:50]}\n" if news_info.get("news_title") else ""
             msg = (
-                f"Score: {mid_score:.3f} | Super: {mid_super:.3f}\\n"
-                f"AH move: {ah_move*100:+.1f}%\\n"
-                f"AH vol ratio: {ah_vol_ratio:.1f}x\\n"
-                f"8K: {'YES 🔥' if has_8k else 'no'}\\n"
-                f"Close: ${pc:.3f}\\n"
+                f"Score: {mid_score:.3f} | Super: {mid_super:.3f}\n"
+                f"AH move: {ah_move*100:+.1f}%\n"
+                f"AH vol ratio: {ah_vol_ratio:.1f}x\n"
+                f"8K: {'YES' if has_8k else 'no'} | PR: {'YES' if has_news else 'no'}\n"
+                + news_line +
+                f"Close: ${pc:.3f}\n"
                 f"Set limit buy for 4AM open"
             )
             send_pushover(title, msg, alert_type, priority=1)
@@ -929,7 +1127,7 @@ def run_morning_scan():
                 log.debug(f"SKIP {ticker} — gap too small ({gap*100:.1f}%)")
                 continue
             # Skip if gap already huge — move likely done
-            if gap > 0.40:
+            if gap > 0.25:
                 log.debug(f"SKIP {ticker} — gap too large ({gap*100:.1f}%)")
                 continue
             # Skip if faded hard from PM high — pump and dump
@@ -944,8 +1142,16 @@ def run_morning_scan():
             si_pct,_    = get_si(ticker)
             edgar       = get_edgar_features(ticker)
             has_8k      = edgar.get("has_8k",0)
+            # Check for recent news
+            news_items  = get_polygon_news(ticker, hours_back=24)
+            news_info   = analyze_news(news_items)
+            has_pr      = news_info.get("has_bullish_pr", 0)
+            # Skip if bearish news
+            if news_info.get("has_bearish_pr", 0):
+                log.info(f"SKIP {ticker} — bearish news (dilution/offering)")
+                continue
             title,msg   = format_alert(ticker,alert_type,scores,price,gap,
-                                       float_M,si_pct,has_8k,mode="morning")
+                                       float_M,si_pct,has_8k or has_pr,mode="morning")
             send_pushover(title,msg,alert_type,1 if alert_type=="super" else 0)
             log_alert(ticker,alert_type,scores,price,gap)
             fired+=1
